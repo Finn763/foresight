@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Foresight 预测展示</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header id="topbar">
+    <h1>Foresight <span class="tag">预测引擎</span></h1>
+    <nav id="tabs">
+      <button class="tab active" data-tab="board">看板</button>
+      <button class="tab" data-tab="system">系统</button>
+      <button class="tab" data-tab="ops">系统日志</button>
+    </nav>
+    <div id="mode-switch"></div>
+  </header>
+  <div id="error-banner" hidden></div>
+  <main id="app"></main>
+
+  <div id="detail-overlay" hidden>
+    <div id="detail-panel">
+      <button id="detail-close" title="关闭">×</button>
+      <div id="detail-body"></div>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -12,7 +12,7 @@
 
 ![Foresight 预测引擎架构](docs/architecture.zh-CN.svg)
 
-[▶ 交互版](https://finn763.github.io/foresight/architecture.zh-CN.html)（平移 / 缩放 / 主题切换 / 焦点追踪）
+[▶ 交互版](https://finn763.github.io/foresight/architecture.zh-CN.html)（平移 / 缩放 / 主题切换 / 焦点追踪）——由 [Archify](https://github.com/tt-a1i/archify) 生成（MIT，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）
 
 ## 技术要点
 

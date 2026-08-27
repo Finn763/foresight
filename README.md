@@ -8,6 +8,18 @@ Architecture = **pi-fork interactive agent shell** (`shell/pi`, renamed `@foresi
 
 > Disclaimer: outputs are probabilistic estimates produced by statistical models and do **not** constitute investment, gambling, or any other decision advice. Prediction-market APIs are used only as internal priors.
 
+## How it works — in one picture
+
+```mermaid
+flowchart LR
+    A["📰 What's happening today"] --> B["🔍 Worth predicting?"]
+    B --> C["🧠 Research & reason"]
+    C --> D["⚙️ Compute a probability"]
+    D --> E["📊 Answer + evidence"]
+    E --> F["✅ Outcome lands → check"]
+    F --> G["🎯 Brier score"]
+```
+
 ## Highlights
 
 - **Prediction pipeline**: Halawi five-step (search-term generation → retrieval → relevance filtering → summarization → base-rate + prediction) + 5–12 model ensemble + order-preserving calibration layer

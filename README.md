@@ -80,7 +80,7 @@ Fork note: `shell/pi` is based on [earendil-works/pi](https://github.com/earendi
 
 | File | Purpose |
 |---|---|
-| `docs/forecastbench提交渠道调研.md` | Survey of official ForecastBench submission channels |
+| `docs/forecastbench-submission-survey.md` | Survey of official ForecastBench submission channels |
 | `shell/BRANDING.md` | pi fork rebrand checklist & upstream-sync procedure |
 
 ## License

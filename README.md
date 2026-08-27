@@ -12,6 +12,8 @@ Architecture = **pi-fork interactive agent shell** (`shell/pi`, renamed `@foresi
 
 ![Foresight prediction engine architecture](docs/architecture.svg)
 
+[▶ Interactive version](https://finn763.github.io/foresight/docs/architecture.html) (pan / zoom / theme switch / focus tracing)
+
 ## Highlights
 
 - **Prediction pipeline**: Halawi five-step (search-term generation → retrieval → relevance filtering → summarization → base-rate + prediction) + 5–12 model ensemble + order-preserving calibration layer

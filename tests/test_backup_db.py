@@ -16,13 +16,24 @@ sys.path.insert(0, str(SCRIPTS))
 import backup_db  # noqa: E402
 
 
+def _make_real_db(path: Path) -> bytes:
+    """造一个真 DuckDB 文件（完整性验证要求副本可 open read_only）。"""
+    import duckdb
+
+    con = duckdb.connect(str(path))
+    con.execute("CREATE TABLE questions(id INTEGER)")
+    con.execute("INSERT INTO questions VALUES (1)")
+    con.close()
+    return path.read_bytes()
+
+
 def test_copy_creates_named_backup_with_identical_bytes(tmp_path):
     db = tmp_path / "data" / "foresight.db"
     db.parent.mkdir()
-    db.write_bytes(b"\x00duckdb-bytes\x01" * 100)
+    src_bytes = _make_real_db(db)
     dest = backup_db.backup_db(db, tmp_path / "data" / "backup", datetime(2026, 8, 27, 2, 30))
     assert dest.name == "foresight-20260827-0230.db"
-    assert dest.read_bytes() == db.read_bytes()
+    assert dest.read_bytes() == src_bytes
     assert dest.stat().st_mtime == db.stat().st_mtime  # copy2 保留源 mtime
 
 
@@ -59,7 +70,7 @@ def test_prune_missing_dir_safe(tmp_path):
 def test_cli_end_to_end(tmp_path):
     db = tmp_path / "data" / "foresight.db"
     db.parent.mkdir()
-    db.write_bytes(b"x" * 64)
+    src_bytes = _make_real_db(db)
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     r = subprocess.run(
@@ -68,7 +79,7 @@ def test_cli_end_to_end(tmp_path):
         capture_output=True, env=env, timeout=120, cwd=tmp_path,
     )
     assert r.returncode == 0, r.stdout.decode("utf-8", errors="ignore")
-    assert (tmp_path / "data" / "backup" / "foresight-20260827-0230.db").read_bytes() == b"x" * 64
+    assert (tmp_path / "data" / "backup" / "foresight-20260827-0230.db").read_bytes() == src_bytes
 
 
 def test_cli_missing_db_exits_1(tmp_path):

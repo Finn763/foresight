@@ -17,6 +17,19 @@ from pathlib import Path
 
 
 def main() -> int:
+    # schtasks 动作已改为 base GUI pythonw（uv 的 venv Scripts\pythonw.exe 是
+    # CONSOLE 子系统跳板，每小时任务都会闪黑框——2026-08-21 实锤）。base 解释器
+    # 不带 venv 环境，这里手动注入：① 项目根 + src（predictor 包在 src 布局下，
+    # editable 的 .pth 指向 src；scripts.evolve 需要项目根）；② venv
+    # site-packages（第三方依赖）。注意 .pth 只在解释器启动时生效，运行中插入
+    # site-packages 不会触发它，故这些路径必须显式加。
+    _root = Path(__file__).resolve().parents[1]
+    _venv_sp = _root / ".venv" / "Lib" / "site-packages"
+    if _venv_sp.is_dir():
+        sys.path.insert(0, str(_venv_sp))
+    sys.path.insert(0, str(_root))
+    sys.path.insert(0, str(_root / "src"))
+
     args = sys.argv[1:]
     if not args:
         print("usage: run_silent.py target.py [log] [args...]", file=sys.stderr)

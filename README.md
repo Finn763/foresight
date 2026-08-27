@@ -28,7 +28,7 @@ foresight/
 ├── tests/               # full pytest suite
 ├── data/fb_seed/        # ForecastBench seed question snapshots (backtesting)
 ├── .foresight/          # agent guardrails SYSTEM.md + tool extension foresight-tools.ts
-├── docs/                # technical docs (architecture plan / ForecastBench survey / STATUS)
+├── docs/                # technical docs (ForecastBench submission survey)
 └── pyproject.toml       # uv-managed Python dependencies (3.12+)
 ```
 
@@ -80,8 +80,6 @@ Fork note: `shell/pi` is based on [earendil-works/pi](https://github.com/earendi
 
 | File | Purpose |
 |---|---|
-| `docs/pi-化架构计划.md` | Dual-layer architecture (agent shell + Python engine) design & migration log |
-| `docs/STATUS.md` | One-page project status |
 | `docs/forecastbench提交渠道调研.md` | Survey of official ForecastBench submission channels |
 | `shell/BRANDING.md` | pi fork rebrand checklist & upstream-sync procedure |
 

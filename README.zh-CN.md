@@ -12,6 +12,8 @@
 
 ![Foresight 预测引擎架构](docs/architecture.zh-CN.svg)
 
+[▶ 交互版](https://finn763.github.io/foresight/docs/architecture.zh-CN.html)（平移 / 缩放 / 主题切换 / 焦点追踪）
+
 ## 技术要点
 
 - **预测管线**：Halawi 五步（搜索词生成 → 检索 → 相关性过滤 → 摘要 → 基准率+预测）+ 5–12 模型集成 + 保序校准层

@@ -5,7 +5,8 @@ schtasks 每小时触发（替代原 LogonTrigger：机器久不重启即不再�
   1. 检查 127.0.0.1:8989 是否已监听（app 绑定 0.0.0.0）→ 已监听则静默 exit 0（幂等）；
   2. 未监听 → DETACHED 拉起 data/mediacrawler-pro-signsrv/app.py（服务自带 .venv，
      Python 3.12，与本项目 .venv 3.13 分离），stdout/stderr 追加 signsrv.log。
-本脚本只用标准库，任意 Python 均可运行（schtasks 动作用项目 .venv python）。
+本脚本只用标准库，任意 Python 均可运行（schtasks 动作 2026-08-21 起改用 base
+GUI pythonw，venv 的 pythonw 是 CONSOLE 跳板会闪黑框）。
 """
 
 import os

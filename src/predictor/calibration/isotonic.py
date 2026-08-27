@@ -42,17 +42,20 @@ def fit_isotonic(preds: list[float], outcomes: list[bool]):
                 outcomes=b1.outcomes + b2.outcomes,
             )
             blocks.append(merged)
-    # 每个块的常数值 = 块内 outcome 频率
-    steps: list[tuple[float, float]] = []
-    for b in blocks:
-        steps.append((b.preds[0], b.value))  # 区间左端
-        steps.append((b.preds[-1], b.value))  # 区间右端
+    # 每个块的常数值 = 块内 outcome 频率；块在其区间左右端点各贡献一次该值。
     # 重复概率点可能落在不同块（同 x 不同 y，PAVA 只在严格逆序时合并），
-    # apply 会命中首个匹配块丢失组内信息 → 同 x 聚合并取 y 均值
-    merged: dict[float, list[float]] = {}
-    for x, y in steps:
-        merged.setdefault(x, []).append(y)
-    steps = [(x, sum(ys) / len(ys)) for x, ys in merged.items()]
+    # apply 会命中首个匹配块丢失组内信息 → 同 x 聚合。
+    # 权重 = 块样本数 n（sum(y·n)/sum(n)）：块大小不参与加权时，同 x 多块
+    # 频率被等权稀释（评审报告 §2.5：4 样本 1 真 → 0.1667 而非 0.25）。
+    merged: dict[float, list[tuple[float, int]]] = {}
+    for b in blocks:
+        merged.setdefault(b.preds[0], []).append((b.value, b.n))
+        if b.preds[-1] != b.preds[0]:
+            merged.setdefault(b.preds[-1], []).append((b.value, b.n))
+    steps: list[tuple[float, float]] = [
+        (x, sum(y * n for y, n in entries) / sum(n for _, n in entries))
+        for x, entries in merged.items()
+    ]
     return IsotonicCalibrator(steps)
 
 

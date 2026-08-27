@@ -1,6 +1,6 @@
 """daily 编排冒烟：无预测的未到期题会被补预测；到期题进待揭晓清单。"""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from predictor.config import Settings
 from predictor.data.storage import Storage
@@ -161,3 +161,32 @@ def test_family_add_logs_question_added(tmp_path, monkeypatch):
     assert any(json.loads(e[0])["qid"] == ids[0] for e in evs)
     added = next(json.loads(e[0]) for e in evs if json.loads(e[0])["qid"] == ids[0])
     assert added["title"] and added["closes"]
+
+
+def test_update_window_boundary_7x24h():
+    """CC §4.3：7 天更新纪律按 7×24 小时差判定（锚定纯流逝时长）。
+    6.9 天 → 窗口内跳过；恰满 7×24h 与 7.1 天 → 窗口外允许更新（阈值用
+    >= 语义，防止边界悬空导致永远不更新）。"""
+    from scripts.daily import _within_update_window
+
+    last = datetime(2026, 8, 20, 9, 0)
+    # 6.9 天（6d21h36m）→ 未满 7×24h，跳过
+    assert _within_update_window(last + timedelta(days=6, hours=21, minutes=36), last)
+    # 恰满 7×24h → 窗口外，允许更新
+    assert not _within_update_window(last + timedelta(hours=7 * 24), last)
+    # 7.1 天 → 窗口外，允许更新
+    assert not _within_update_window(last + timedelta(days=7, hours=2, minutes=24), last)
+
+
+def test_update_window_dst_independent_elapsed_semantics():
+    """CC §4.3 跨夏令时语义：判定只看真实流逝时长，与墙钟日历日差无关。
+    2026-03-08 美东春令时 02:00 拨快 1h：3-08 00:30 EST → 3-15 01:00 EDT
+    墙钟跨 7 个日历日（date 相减 .days==7），但真实流逝 6d23h30m < 7×24h
+    → 仍判窗口内跳过。若回归为日历日差实现会在此误判为可更新。"""
+    from scripts.daily import _within_update_window
+
+    last = datetime(2026, 3, 8, 0, 30, tzinfo=timezone(timedelta(hours=-5)))  # EST
+    now = datetime(2026, 3, 15, 1, 0, tzinfo=timezone(timedelta(hours=-4)))  # EDT
+    assert (now.date() - last.date()).days == 7  # 墙钟日历日差恰为 7
+    assert 0 <= (now - last).total_seconds() < 7 * 24 * 3600  # 真实流逝不足 7×24h
+    assert _within_update_window(now, last), "DST 场景必须以真实流逝时长为准"

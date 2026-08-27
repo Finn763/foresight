@@ -357,3 +357,46 @@ def test_build_base_rates_canonical_titles(monkeypatch):
     rates = ev._build_base_rates(now=datetime(2026, 8, 27, 9, 0))
     assert "标普" in rates
     assert 0.0 < rates["标普"] < 1.0
+
+
+def test_predict_round_7day_update_window_elapsed_hours(tmp_path, monkeypatch):
+    """CC §4.3 接线验证：预测轮 7 天更新纪律按 7×24 小时差判定——上次预测
+    6.9 天前 → 本轮跳过（预测数不变）；7.1 天前 → 本轮补跑（预测数 +1）。
+    阈值语义（含 DST）由 test_daily 的 _within_update_window 单测锁定。"""
+    import scripts.daily as daily
+    from predictor.pipeline import Prediction
+
+    def fake_pred(qid, st, client, now, **kw):
+        pid = st.add_prediction(qid, 0.5, evidence_ids=[1], model_runs={})
+        return Prediction(
+            id=pid,
+            question_id=qid,
+            probability=0.5,
+            rationale="",
+            evidence_ids=[1],
+            model_runs={},
+            report_md="",
+        )
+
+    st = Storage(str(tmp_path / "win.db"))
+    st.create_schema()
+    now = datetime(2026, 8, 27, 9, 0)
+    qid = st.add_question("7天窗口题", now + timedelta(days=14))
+    st.add_prediction(qid, 0.4, evidence_ids=[1], model_runs={})
+    monkeypatch.setattr(daily, "predict_with_websearch", fake_pred)
+
+    # 6.9 天前预测 → 未满 7×24h，窗口内跳过
+    st._conn.execute(
+        "UPDATE predictions SET created_at = ? WHERE question_id = ?",
+        [now - timedelta(days=6, hours=21, minutes=36), qid],
+    )
+    predict_round(st, now=now, client=object(), sources=[], base_rates={})
+    assert st.count_predictions(qid) == 1
+
+    # 7.1 天前预测 → 满 7×24h，窗口外补跑更新
+    st._conn.execute(
+        "UPDATE predictions SET created_at = ? WHERE question_id = ?",
+        [now - timedelta(days=7, hours=2, minutes=24), qid],
+    )
+    predict_round(st, now=now, client=object(), sources=[], base_rates={})
+    assert st.count_predictions(qid) == 2

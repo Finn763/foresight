@@ -182,3 +182,120 @@ def test_auto_resolve_class_b_uses_llm_resolver_and_merges_extra(storage, monkey
         "SELECT detail FROM evolution_log WHERE event_type='resolution_ok'"
     ).fetchone()[0]
     assert '"source": "llm_websearch"' in detail and "https://a/1" in detail
+
+
+class _BoomResolver:
+    """resolver.resolve 内部抛异常的假 resolver（CC §2.7③ 场景）。"""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def resolve(self, q, spec, now):
+        raise self._exc
+
+
+def test_auto_resolve_resolver_exception_logs_qid_and_type(storage, monkeypatch):
+    """resolver 内部异常不再被裸 except 吞掉：计 degraded + resolution_failed
+    记录题 id 与异常类型/消息（与其它路径日志口径一致）。"""
+    qid = _due_question(storage, _spec())
+    monkeypatch.setattr(
+        auto_resolve, "get_resolver", lambda cls, storage=None: _BoomResolver(RuntimeError("net exploded"))
+    )
+    stats = auto_resolve.auto_resolve(storage, now=datetime.now())
+    assert stats == {"resolved": 0, "degraded": 1, "pending": 0}
+    assert storage.get_question(qid).outcome is None
+    events = storage._conn.execute(
+        "SELECT event_type, detail FROM evolution_log"
+    ).fetchall()
+    assert [e[0] for e in events] == ["resolution_failed"]
+    assert f'"qid": {qid}' in events[0][1]
+    assert "RuntimeError" in events[0][1] and "net exploded" in events[0][1]
+
+
+class _SelectiveResolver:
+    """按题 id 分派：qid_boom 抛异常，其余题正常返回（验证整轮不被击垮）。"""
+
+    def __init__(self, qid_boom, outcome):
+        self._qid_boom = qid_boom
+        self._outcome = outcome
+
+    def resolve(self, q, spec, now):
+        if q.id == self._qid_boom:
+            raise ValueError("bad quote")
+        return self._outcome
+
+
+def test_auto_resolve_resolver_exception_keeps_round_alive(storage, monkeypatch):
+    """一道题 resolver 抛异常不击垮整轮：其余题照常揭晓，异常题记 resolution_failed。"""
+    qid_bad = _due_question(storage, _spec())
+    qid_good = _due_question(storage, _spec())
+    monkeypatch.setattr(
+        auto_resolve,
+        "get_resolver",
+        lambda cls, storage=None: _SelectiveResolver(qid_bad, (True, "sina")),
+    )
+    stats = auto_resolve.auto_resolve(storage, now=datetime.now())
+    assert stats == {"resolved": 1, "degraded": 1, "pending": 0}
+    assert storage.get_question(qid_bad).outcome is None
+    assert storage.get_question(qid_good).outcome is True
+    events = storage._conn.execute(
+        "SELECT event_type, detail FROM evolution_log"
+    ).fetchall()
+    assert sorted(e[0] for e in events) == ["resolution_failed", "resolution_ok"]
+    failed = [e for e in events if e[0] == "resolution_failed"][0]
+    assert f'"qid": {qid_bad}' in failed[1]
+    assert "ValueError" in failed[1] and "bad quote" in failed[1]
+
+
+def test_auto_resolve_refreshes_calibrator_when_resolved(storage, monkeypatch):
+    """CC §2.4：本轮 resolved > 0 时尾部调用 refresh_from_storage（mock 断言被调）。"""
+    calls = []
+
+    def fake_refresh(st, **kwargs):
+        calls.append(st)
+        return True
+
+    _due_question(storage, _spec())
+    monkeypatch.setattr(
+        auto_resolve, "get_resolver", lambda cls, storage=None: _FakeResolver((True, "sina"))
+    )
+    monkeypatch.setattr(auto_resolve, "refresh_from_storage", fake_refresh)
+    stats = auto_resolve.auto_resolve(storage, now=datetime.now())
+    assert stats == {"resolved": 1, "degraded": 0, "pending": 0}
+    assert calls == [storage]
+
+
+def test_auto_resolve_no_refresh_when_nothing_resolved(storage, monkeypatch):
+    """CC §2.4：本轮无成功揭晓（resolved == 0）不触发校准器刷新。"""
+    _due_question(storage, _spec(class_="C"))
+    monkeypatch.setattr(
+        auto_resolve,
+        "refresh_from_storage",
+        lambda *a, **k: pytest.fail("resolved==0 时不应调用 refresh_from_storage"),
+    )
+    monkeypatch.setattr(
+        auto_resolve, "get_resolver", lambda cls, storage=None: _FakeResolver((True, "sina"))
+    )
+    stats = auto_resolve.auto_resolve(storage, now=datetime.now())
+    assert stats == {"resolved": 0, "degraded": 0, "pending": 1}
+
+
+def test_auto_resolve_refresh_failure_logs_and_does_not_crash(storage, monkeypatch):
+    """CC §2.4：校准器刷新抛异常 → 降级记 calibrator_refresh_failed，不阻塞本轮结果。"""
+    qid = _due_question(storage, _spec())
+    monkeypatch.setattr(
+        auto_resolve, "get_resolver", lambda cls, storage=None: _FakeResolver((True, "sina"))
+    )
+
+    def boom(st, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(auto_resolve, "refresh_from_storage", boom)
+    stats = auto_resolve.auto_resolve(storage, now=datetime.now())
+    assert stats == {"resolved": 1, "degraded": 0, "pending": 0}
+    assert storage.get_question(qid).outcome is True
+    events = storage._conn.execute(
+        "SELECT event_type, detail FROM evolution_log"
+    ).fetchall()
+    assert [e[0] for e in events] == ["resolution_ok", "calibrator_refresh_failed"]
+    assert "OSError" in events[1][1] and "disk full" in events[1][1]

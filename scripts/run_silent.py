@@ -15,6 +15,30 @@ import runpy
 import sys
 from pathlib import Path
 
+LOG_MAX_BYTES = 1024 * 1024  # 日志轮转上限：超过后原文件改 .1 后缀重开（评审 §3.6）
+
+
+def rotate_log_if_needed(log_path: Path, max_bytes: int = LOG_MAX_BYTES) -> bool:
+    """日志超限轮转：原文件改名 .1（丢弃旧的 .1），随后按 append 语义重开新文件。
+
+    轮转失败（文件被其他进程占用等）静默返回 False——宁可继续 append 原文件，
+    也不阻断定时任务本身。返回值供测试断言。
+    """
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return False
+    if size < max_bytes:
+        return False
+    rotated = log_path.with_name(log_path.name + ".1")
+    try:
+        if rotated.exists():
+            rotated.unlink()
+        log_path.replace(rotated)
+    except OSError:
+        return False
+    return True
+
 
 def main() -> int:
     # schtasks 动作已改为 base GUI pythonw（uv 的 venv Scripts\pythonw.exe 是
@@ -48,6 +72,9 @@ def main() -> int:
     # 假 TextIOWrapper（实测探针），按 None 判断会漏——输出全部进黑洞。故一律
     # 打开日志文件替换句柄；交互调试时输出进日志而非终端（tail 即可看）。
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # 超限轮转在重定向前做（此时 print 仍指向 pythonw 的无效句柄，不能输出）；
+    # 轮转后以 append 打开新文件，历史内容保存在 <日志>.1，语义不变。
+    rotate_log_if_needed(log_path)
     _log = open(log_path, "a", buffering=1, encoding="utf-8", errors="replace")
     sys.stdout = _log
     sys.stderr = _log

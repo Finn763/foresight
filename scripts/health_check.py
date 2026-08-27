@@ -2,14 +2,19 @@
 
 复用 ops 三件套（build_facts / probes / assess）红黄绿判定 + 补充 24h 事件规则。
 入场控制：复用 evolve.lock 机制排队等锁（--lock-wait 上限 45 分钟，轮次结束即接手）；
-等锁超时兜底告警落盘（监控不在被监控对象持锁时失明——2026-08-27 09:35 实测 daily
+等锁超时兜底告警落盘（监控不在被监控对象持锁时失明——实测 daily
 轮持 DuckDB 独占锁 39 分钟，旧 6×10s 重试必败）；拿到锁后持锁执行全部 DB 读，
 与轮次互斥杜绝对撞。
 异常 → 写 data/alerts/alert-*.md + 弹 Windows toast + 退出码 1（schtasks 记失败）；
 正常 → 静默退出 0（watchdog 语义：没事不打扰）。
+
+告警消费（评审 §3.5）：同日同类告警合并去重（同一天同一类异常只保留/刷新一个
+文件，不刷屏）+ 30 天自动清理；已被确认（.ack 后缀）的文件不参与合并——确认后
+同类复发按新告警落盘，dashboard 横幅重现。
 """
 
 import argparse
+import re
 import subprocess
 import sys
 import time
@@ -22,6 +27,109 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _ALERT_TYPES = ("llm_resolve_failed", "prediction_skipped", "resolution_failed")
 _SKIP_WARN_THRESHOLD = 5  # 24h 内 prediction_skipped ≥ 5 → 告警（疑似 key/网络系统性故障）
+_ALERT_RETENTION_DAYS = 30  # 告警文件保留窗口（评审 §3.5）
+_ACK_SUFFIX = ".ack"  # 已确认告警的后缀：alert-*.ack.md 不参与合并、不进 dashboard 横幅
+
+
+def _normalize_alert_line(line: str) -> str:
+    """同类归一：数字序列折叠为 #——「LLM 揭晓失败 2 次」与「…5 次」视为同类。"""
+    return re.sub(r"\d+", "#", line)
+
+
+def _alert_signature(lines: list[str], *, is_error: bool) -> str:
+    """告警签名：error 类取首行标题；普通告警取「## 告警」小节要点（归一+排序）。"""
+    if is_error:
+        heading = next((ln.strip() for ln in lines if ln.startswith("# ")), "")
+        return f"err|{heading}"
+    bullets = []
+    in_alerts = False
+    for ln in lines:
+        if ln == "## 告警":
+            in_alerts = True
+            continue
+        if in_alerts:
+            if ln == "## 全量检查":
+                break
+            if ln.startswith("- "):
+                bullets.append(_normalize_alert_line(ln))
+    return "alert|" + "\n".join(sorted(bullets))
+
+
+def _signature_of_file(f: Path) -> str | None:
+    try:
+        lines = f.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    return _alert_signature(lines, is_error=f.name.endswith("-health-error.md"))
+
+
+def find_same_day_duplicate(
+    out_dir: Path, now: datetime, lines: list[str], *, is_error: bool
+) -> Path | None:
+    """同日同签名且未确认的既有告警文件 → 返回之；否则 None。
+
+    已确认（.ack.md）的文件跳过：确认后同类复发按新告警落盘，横幅重现。
+    """
+    sig = _alert_signature(lines, is_error=is_error)
+    for f in sorted(out_dir.glob(f"alert-{now:%Y%m%d}-*.md")):
+        if f.name.endswith(f"{_ACK_SUFFIX}.md"):
+            continue
+        if f.name.endswith("-health-error.md") != is_error:
+            continue
+        if _signature_of_file(f) == sig:
+            return f
+    return None
+
+
+def cleanup_stale_alerts(
+    out_dir: Path, now: datetime, *, retention_days: int = _ALERT_RETENTION_DAYS
+) -> list[Path]:
+    """删除早于保留窗口的告警文件（文件名日期判定，解析失败按 mtime 兜底）。"""
+    if not out_dir.is_dir():
+        return []
+    cutoff = now.date() - timedelta(days=retention_days)
+    removed = []
+    for f in out_dir.glob("alert-*.md"):
+        try:
+            day = datetime.strptime(f.name[6:14], "%Y%m%d").date()
+        except ValueError:
+            try:
+                day = datetime.fromtimestamp(f.stat().st_mtime).date()
+            except OSError:
+                continue
+        if day < cutoff:
+            try:
+                f.unlink()
+                removed.append(f)
+            except OSError:
+                pass
+    return removed
+
+
+def write_alert_file(
+    out_dir: Path, now: datetime, lines: list[str], *, is_error: bool
+) -> tuple[Path, bool]:
+    """告警落盘统一入口：同日同类合并去重 + 30 天清理。返回 (文件, 是否合并)。
+
+    合并 = 把本次（更新的）内容写回既有文件（保留原文件名），不再新建文件。
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_alerts(out_dir, now)
+    dup = find_same_day_duplicate(out_dir, now, lines, is_error=is_error)
+    if dup is not None:
+        dup.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return dup, True
+    suffix = "-health-error" if is_error else ""
+    base = f"alert-{now:%Y%m%d-%H%M%S}"
+    name = f"{base}{suffix}.md"
+    i = 2
+    while (out_dir / name).exists():
+        # 同一秒内不同类别告警落盘：-N 消歧，绝不互相覆盖
+        name = f"{base}-{i}{suffix}.md"
+        i += 1
+    f = out_dir / name
+    f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return f, False
 
 
 def _toast(title: str, body: str) -> None:
@@ -134,6 +242,8 @@ def main(argv=None) -> int:
 
     db_path = args.db or Settings().db_path
     out_dir = Path(db_path).parent / "alerts"  # 不依赖 cwd（schtasks 工作目录不可控）
+    # 每次巡检顺手清理超 30 天的告警（即使今天零告警也执行；目录不存在时是 no-op）
+    cleanup_stale_alerts(out_dir, datetime.now())
     lock_path = Path(db_path).parent / "evolve.lock"
     try:
         from predictor.ops.lock import LockWaitTimeout, wait_acquire
@@ -153,83 +263,63 @@ def main(argv=None) -> int:
             alerts, report = collect(st, now, lock_state="none")
     except LockWaitTimeout as e:
         # 兜底告警：排队超时也必须有可见产物——监控不能在被监控对象持锁时失明
-        # （2026-08-27 09:35 实测 daily 轮持锁 39 分钟，评审 §3.1）。
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # （实测 daily 轮持锁超过巡检等锁上限，评审 §3.1）。
         now = datetime.now()
-        f = out_dir / f"alert-{now:%Y%m%d-%H%M%S}-health-error.md"
-        f.write_text(
-            "\n".join(
-                [
-                    "# Foresight 健康自检异常（等待轮次锁超时）",
-                    "",
-                    f"检出时间：{now:%Y-%m-%d %H:%M:%S}",
-                    "",
-                    f"health_check 排队等待 evolve.lock 超过 {args.lock_wait} 秒上限"
-                    + (f"（{args.lock_wait // 60} 分钟）" if args.lock_wait >= 60 else "")
-                    + "。",
-                    "",
-                    f"异常：{e}",
-                    "",
-                    "判定建议：轮次可能挂死或异常超长，需人工确认 daily/evolve 进程；"
-                    "轮次正常结束后下轮巡检自动恢复。",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        lines = [
+            "# Foresight 健康自检异常（等待轮次锁超时）",
+            "",
+            f"检出时间：{now:%Y-%m-%d %H:%M:%S}",
+            "",
+            f"health_check 排队等待 evolve.lock 超过 {args.lock_wait} 秒上限"
+            + (f"（{args.lock_wait // 60} 分钟）" if args.lock_wait >= 60 else "")
+            + "。",
+            "",
+            f"异常：{e}",
+            "",
+            "判定建议：轮次可能挂死或异常超长，需人工确认 daily/evolve 进程；"
+            "轮次正常结束后下轮巡检自动恢复。",
+        ]
+        write_alert_file(out_dir, now, lines, is_error=True)
         traceback.print_exc()
         return 1
     except SystemExit as e:
         # 竞态边缘：wait_acquire 判定空闲后、正式接管前被轮次抢锁 → acquire_lock 抛
         # SystemExit。同款兜底告警（绝不静默 exit 无痕迹）。
-        out_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now()
-        f = out_dir / f"alert-{now:%Y%m%d-%H%M%S}-health-error.md"
-        f.write_text(
-            "\n".join(
-                [
-                    "# Foresight 健康自检异常（锁竞争：等待窗口被抢占）",
-                    "",
-                    f"检出时间：{now:%Y-%m-%d %H:%M:%S}",
-                    "",
-                    "health_check 等锁判定空闲后，接管瞬间被轮次抢先持锁。",
-                    "",
-                    f"异常：{e}",
-                    "",
-                    "判定建议：单次竞态，下轮巡检自动恢复；若反复出现需检查 daily/evolve "
-                    "与巡检的调度重叠。",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        lines = [
+            "# Foresight 健康自检异常（锁竞争：等待窗口被抢占）",
+            "",
+            f"检出时间：{now:%Y-%m-%d %H:%M:%S}",
+            "",
+            "health_check 等锁判定空闲后，接管瞬间被轮次抢先持锁。",
+            "",
+            f"异常：{e}",
+            "",
+            "判定建议：单次竞态，下轮巡检自动恢复；若反复出现需检查 daily/evolve "
+            "与巡检的调度重叠。",
+        ]
+        write_alert_file(out_dir, now, lines, is_error=True)
         traceback.print_exc()
         return 1
     except Exception as e:
         # 撞锁等异常也必须落一个可见产物（data/alerts/），不能静默 exit 1 无痕迹——
         # schtasks 的 >> data\health.log 已捕获 traceback，这里补一份结构化告警。
-        out_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now()
-        f = out_dir / f"alert-{now:%Y%m%d-%H%M%S}-health-error.md"
-        f.write_text(
-            "\n".join(
-                [
-                    "# Foresight 健康自检异常（未完成检测）",
-                    "",
-                    f"检出时间：{now:%Y-%m-%d %H:%M:%S}",
-                    "",
-                    "health_check 在打开数据库/收集事实阶段异常退出，可能是 daily/evolve",
-                    "轮次持锁撞库或 DB 损坏。",
-                    "",
-                    f"异常：{type(e).__name__}: {e}",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        lines = [
+            "# Foresight 健康自检异常（未完成检测）",
+            "",
+            f"检出时间：{now:%Y-%m-%d %H:%M:%S}",
+            "",
+            "health_check 在打开数据库/收集事实阶段异常退出，可能是 daily/evolve",
+            "轮次持锁撞库或 DB 损坏。",
+            "",
+            f"异常：{type(e).__name__}: {e}",
+        ]
+        write_alert_file(out_dir, now, lines, is_error=True)
         traceback.print_exc()
         return 1
 
     if alerts:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        f = out_dir / f"alert-{now:%Y%m%d-%H%M%S}.md"
         lines = [
             "# Foresight 健康告警",
             "",
@@ -242,8 +332,11 @@ def main(argv=None) -> int:
         lines += ["", "## 全量检查", ""]
         for c in report["checks"]:
             lines.append(f"- [{c['status']}] {c['summary']}")
-        f.write_text("\n".join(lines), encoding="utf-8")
-        print(f"ALERT: {len(alerts)} 项异常 → {f}")
+        f, merged = write_alert_file(out_dir, now, lines, is_error=False)
+        if merged:
+            print(f"ALERT: {len(alerts)} 项异常（同日同类已合并）→ {f}")
+        else:
+            print(f"ALERT: {len(alerts)} 项异常 → {f}")
         for a in alerts:
             print(f"  - {a}")
         if not args.no_notify:

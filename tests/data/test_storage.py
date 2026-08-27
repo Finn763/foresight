@@ -157,3 +157,42 @@ def test_source_market_ids_dedup(storage):
     )
     assert storage.source_market_ids("polymarket") == {"101", "102"}
     assert storage.source_market_ids("other") == set()
+
+
+# ---- CC §2.7①：证据表 (question_id,url) 唯一约束（2026-08-27）----
+
+
+def test_add_document_duplicate_url_ignored(storage):
+    """同 (question_id,url) 重复插入被唯一索引忽略，返回既有行 id（7 天重预测防重复）。"""
+    qid = storage.add_question("去重题", datetime.now() + timedelta(days=5))
+    id1 = storage.add_document(qid, "gdelt", "http://x/1", "标题", "正文", published_at=None)
+    id2 = storage.add_document(qid, "gdelt", "http://x/1", "标题", "正文", published_at=None)
+    assert id2 == id1
+    n = storage._conn.execute(
+        "SELECT COUNT(*) FROM source_documents WHERE question_id = ?", [qid]
+    ).fetchone()[0]
+    assert n == 1
+
+
+def test_add_document_same_url_different_question_ok(storage):
+    """同一 URL 可作不同题的证据（唯一性只约束 (question_id,url) 组合）。"""
+    q1 = storage.add_question("题一", datetime.now() + timedelta(days=5))
+    q2 = storage.add_question("题二", datetime.now() + timedelta(days=5))
+    i1 = storage.add_document(q1, "gdelt", "http://x/2", "t", "c", published_at=None)
+    i2 = storage.add_document(q2, "gdelt", "http://x/2", "t", "c", published_at=None)
+    assert i1 != i2
+
+
+def test_add_document_null_url_not_deduped(storage):
+    """url IS NULL 不参与唯一性（DuckDB 唯一索引视 NULL 互异），可重复入库。"""
+    qid = storage.add_question("无URL题", datetime.now() + timedelta(days=5))
+    i1 = storage.add_document(qid, "crawler", None, "t", "c", published_at=None)
+    i2 = storage.add_document(qid, "crawler", None, "t", "c", published_at=None)
+    assert i1 != i2
+
+
+def test_add_document_not_null_violation_still_raises(storage):
+    """INSERT OR IGNORE 只吞唯一性冲突：source NOT NULL 违反仍抛异常（防静默丢证据）。"""
+    qid = storage.add_question("坏数据题", datetime.now() + timedelta(days=5))
+    with pytest.raises(Exception):
+        storage.add_document(qid, None, "http://x/3", "t", "c", published_at=None)

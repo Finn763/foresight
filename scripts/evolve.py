@@ -1,6 +1,6 @@
 """python scripts/evolve.py [predict|resolve|all] [--db path]
 自我进化闭环编排（单入口）：
-  预测轮（09:05）：① 未到期题补预测/7天更新（臂A，臂B按候选杠杆触发）② 题族补充 ③ 战绩快照
+  预测轮（09:05）：① 未到期题补预测/7×24h 更新（臂A，臂B按候选杠杆触发）② 题族补充 ③ 战绩快照
   揭晓轮（16:30）：① 宽限过期 A 类兜底降级人工（T4 遗留，编排层职责，每题只记一次日志）
                   ② auto_resolve（A/B 类）③ 到期未揭晓 C 类 → resolutions.template.csv
                   ④ 周一额外生成周报骨架（data/weekly_review/YYYY-WW.md）
@@ -70,9 +70,9 @@ def _build_base_rates(now: datetime | None = None) -> dict:
 
 
 def predict_round(st, *, now: datetime, client, sources, base_rates: dict | None = None) -> dict:
-    """预测轮：① 未到期未预测/≥7 天未更新 → 臂 A 预测（臂 B 仅在候选杠杆存在时
+    """预测轮：① 未到期未预测/满 7×24 小时未更新 → 臂 A 预测（臂 B 仅在候选杠杆存在时
     触发，P0 恒无）② 题族补充（base_rates 注入难度三档，尽力而为）③ 战绩快照。"""
-    from scripts.daily import _log_event, _predict_safely
+    from scripts.daily import _log_event, _predict_safely, _within_update_window
 
     stats = {"predicted": 0, "skipped": 0, "families_added": 0}
     candidate = get_active_candidate(st)
@@ -80,7 +80,7 @@ def predict_round(st, *, now: datetime, client, sources, base_rates: dict | None
         if q.closes_at <= now:
             continue
         last = st.last_prediction_at(q.id)
-        if last is not None and (now - last).days < 7:
+        if last is not None and _within_update_window(now, last):
             continue
         pa = _predict_safely(q.id, st, client, sources, now)
         if pa is not None:

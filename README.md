@@ -8,17 +8,9 @@ Architecture = **pi-fork interactive agent shell** (`shell/pi`, renamed `@foresi
 
 > Disclaimer: outputs are probabilistic estimates produced by statistical models and do **not** constitute investment, gambling, or any other decision advice. Prediction-market APIs are used only as internal priors.
 
-## How it works — in one picture
+## How it works
 
-```mermaid
-flowchart LR
-    A["📰 What's happening today"] --> B["🔍 Worth predicting?"]
-    B --> C["🧠 Research & reason"]
-    C --> D["⚙️ Compute a probability"]
-    D --> E["📊 Answer + evidence"]
-    E --> F["✅ Outcome lands → check"]
-    F --> G["🎯 Brier score"]
-```
+![Foresight prediction engine architecture](docs/architecture.svg)
 
 ## Highlights
 

@@ -10,8 +10,10 @@ classic 管线（pipeline.run_prediction）保留：回测、历史文档溯源�
 全部采样失败 → None（evolution_log 记 prediction_skipped）。
 """
 
+import asyncio
 import json
 import statistics
+import sys
 from datetime import datetime
 
 from predictor.calibration.calibrate import (
@@ -20,7 +22,6 @@ from predictor.calibration.calibrate import (
     load_calibrator,
 )
 from predictor.calibration.isotonic import IsotonicCalibrator
-from predictor.llm.client import LLMError
 from predictor.pipeline import Prediction
 
 _FORECAST_INSTRUCTIONS = (
@@ -104,10 +105,7 @@ def _extract_citations(raw: dict, verdict: dict) -> list[str]:
     return citations
 
 
-def _sample(
-    title: str, closes_at: datetime, now: datetime, client, baseline, historical_context: str
-) -> dict:
-    """单次采样：服务端搜索 + 概率输出。失败抛 LLMError/ValueError（调用方按采样作废）。"""
+def _build_instructions(title, closes_at, now, baseline, historical_context: str) -> str:
     instructions = _FORECAST_INSTRUCTIONS.format(
         title=title,
         closes_iso=closes_at.isoformat(timespec="seconds"),
@@ -116,14 +114,11 @@ def _sample(
     instructions += _baseline_block(baseline)
     if historical_context:
         instructions += "\n【历史数据上下文】" + str(historical_context)[:4000]
-    raw = client.responses_create(
-        input="请检索证据并预测该事件发生的概率。",
-        instructions=instructions,
-        tools=[{"type": "web_search"}],
-        tool_choice={"type": "web_search"},
-        temperature=0.5,
-        json_format=True,
-    )
+    return instructions
+
+
+def _parse_sample(raw: dict) -> dict:
+    """校验并解析单次采样结果：概率必须合法、web_search_call 必须发生（引用可信）。"""
     text = _extract_text(raw)
     verdict = json.loads(text or "{}")
     prob = verdict.get("probability")
@@ -139,6 +134,38 @@ def _sample(
         "rationale": str(verdict.get("rationale") or "")[:2000],
         "citations": _extract_citations(raw, verdict),
     }
+
+
+async def _asample(
+    title: str, closes_at: datetime, now: datetime, client, baseline, historical_context: str
+) -> dict:
+    """单次采样（async，供并发 gather 直接 await）。失败抛 LLMError/ValueError（调用方按采样作废）。"""
+    raw = await client.aresponses_create(
+        input="请检索证据并预测该事件发生的概率。",
+        instructions=_build_instructions(title, closes_at, now, baseline, historical_context),
+        tools=[{"type": "web_search"}],
+        tool_choice={"type": "web_search"},
+        temperature=0.5,
+        json_format=True,
+    )
+    return _parse_sample(raw)
+
+
+def _sample(
+    title: str, closes_at: datetime, now: datetime, client, baseline, historical_context: str
+) -> dict:
+    """单次采样同步封装（串行路径/测试基准用；生产入口 websearch_predict 走并发）。"""
+    return asyncio.run(_asample(title, closes_at, now, client, baseline, historical_context))
+
+
+def _heartbeat(msg: str) -> None:
+    """进度心跳 → stderr（TUI/日志可见，不影响 stdout JSON 契约）。
+
+    失败静默：stderr 写异常（如管道关闭）吞掉，绝不因心跳抛错中断预测。"""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 def _report(
@@ -186,14 +213,30 @@ def websearch_predict(
     """原生搜索预测入口。失败返回 None（可溯源纪律：无证据/全采样失败不出预测）。"""
     if calibrator is ...:  # 生产默认：加载落盘校准器（缺失/样本不足已由 resolve 侧控）
         calibrator = load_calibrator(DEFAULT_CALIBRATOR_PATH)
-    samples: list[dict] = []
-    for _ in range(n_samples):
+    # 心跳①：序列拉取（历史基线/上下文）由调用方在进入本入口前完成（cli 内联、
+    # predict_with_websearch 的 _load_baseline），此处宣告进入 LLM 采样阶段。
+    _heartbeat(
+        f"[predict] 序列拉取阶段结束，开始 {n_samples} 路并发 LLM 采样"
+    )
+
+    async def _one(i: int) -> dict | None:
+        """采样 i（1-based 标签）：失败作废该采样，不影响其余并发任务。"""
         try:
-            samples.append(_sample(title, closes_at, now, client, baseline, historical_context))
-        except (LLMError, ValueError, json.JSONDecodeError, KeyError):
-            continue
-        except Exception:
-            continue
+            s = await _asample(title, closes_at, now, client, baseline, historical_context)
+        except Exception:  # LLMError/ValueError/JSONDecodeError/KeyError 等 → 该采样作废
+            _heartbeat(f"[predict] 采样 {i + 1}/{n_samples} 失败（作废）")
+            return None
+        _heartbeat(f"[predict] 采样 {i + 1}/{n_samples} 完成")
+        return s
+
+    async def _run_all() -> list:
+        # gather 必须在 asyncio.run 创建的循环内调用（3.13：循环外 gather 会挂到
+        # deprecated 的临时 loop 上，task 跨 loop 报错）。返回顺序 = 任务顺序 = 采样顺序，
+        # 聚合逻辑（samples[0].rationale、probs 均值）保持一致（CC §4.2 并发化）。
+        return await asyncio.gather(*(_one(i) for i in range(n_samples)))
+
+    results = asyncio.run(_run_all())
+    samples = [s for s in results if isinstance(s, dict)]
     if not samples:
         _log_skip(storage, question_id, "websearch all samples failed")
         return None

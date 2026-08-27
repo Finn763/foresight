@@ -264,6 +264,10 @@ def test_predict_round_predicts_newly_added_family_immediately(tmp_path):
         def responses_create(self, **kw):
             return _resp()
 
+        async def aresponses_create(self, **kw):
+            # 2026-08-27 采样并发化后 websearch_predict 走异步入口（CC §4.2）
+            return _resp()
+
     st = Storage(str(tmp_path / "e2.db"))
     st.create_schema()
     now = datetime(2026, 8, 17, 9, 5)  # 周一

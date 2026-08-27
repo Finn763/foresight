@@ -571,6 +571,17 @@ export default function (pi: ExtensionAPI) {
   // 写工具
   // ---------------------------------------------------------------------------
 
+  // predict 工具超时必须 ≥ 引擎最坏时长（CC 评审 §4.2：工具层超时不得早于引擎内部完成，
+  // 否则 python 被 kill 后 agent 盲目重试 → TUI 挂起，STATUS 曾记「predict 挂起 17 分钟」）。
+  // 引擎最坏时长计算依据（src/predictor/llm/client.py + websearch_predictor.py）：
+  //   - 单次采样最坏 = responses API timeout 120s × 3 次尝试（max_retries=2）+ 指数退避 1s+2s
+  //     ≈ 363s；
+  //   - n_samples=2 采样已改 asyncio.gather 并发（2026-08-27）→ 采样阶段最坏 ≈ 363s（不再 ×2）；
+  //   - 加序列拉取（历史基线 fetch_series_map，实测 ~20s）→ 并发后引擎最坏 ≈ 6.4 分钟；
+  //   - 并发修复前串行最坏 ≈ 2×363 + 20 ≈ 12.5 分钟（180s 超时必然先触发，挂起实锤来源）。
+  // 取值 15 分钟：对并发最坏 ≈2.3× 余量，且完整覆盖串行最坏（防回退兜底）。
+  const PREDICT_TOOL_TIMEOUT_MS = 900_000; // 15 分钟 ≥ 引擎最坏时长
+
   pi.registerTool({
     name: "predict",
     label: "Predict",
@@ -584,7 +595,7 @@ export default function (pi: ExtensionAPI) {
       const args = [];
       if (params.closes) args.push("--closes", params.closes);
       args.push("--", params.question);
-      const { stdout } = await runPython(pi, ctx.cwd, ["scripts/predict_cli.py", ...args], 180_000, signal);
+      const { stdout } = await runPython(pi, ctx.cwd, ["scripts/predict_cli.py", ...args], PREDICT_TOOL_TIMEOUT_MS, signal);
       return { content: [{ type: "text", text: stdout }], details: {} };
     },
   });

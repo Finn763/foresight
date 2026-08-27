@@ -165,3 +165,47 @@ def test_responses_create_explicit_truncation_jumps_to_ceiling_and_bounds_reason
     assert seen[0] == (4096, None)
     assert seen[1] == (65536, {"effort": "low"})
     assert seen[2] == (65536, {"effort": "low"})
+
+
+class _CountingCloseTransport(httpx.AsyncBaseTransport):
+    """记录 aclose 次数：AsyncClient 每重建一次就会 aclose 一次 transport
+    （httpx.AsyncClient.aclose → transport.aclose，含外部传入的 transport）。"""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.requests = 0
+        self.closes = 0
+
+    async def handle_async_request(self, request):
+        self.requests += 1
+        return self._handler(request)
+
+    async def aclose(self):
+        self.closes += 1
+
+
+def test_responses_create_reuses_async_client_across_retries():
+    """CC §4.2：重试不再重建 AsyncClient——3 次尝试只建/关 1 个 client
+    （旧实现每尝试重建 → closes=3）。"""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(200, json={"output": [{"type": "output_text", "content": "ok"}]})
+
+    transport = _CountingCloseTransport(handler)
+    client = LLMClient(
+        base_url="https://api.deepseek.com",
+        api_key="k",
+        model="deepseek-v4-flash",
+        max_retries=2,
+        timeout=10.0,
+        _transport=transport,
+    )
+    out = client.responses_create(input="a", instructions="b", tools=[], tool_choice="none")
+    assert calls["n"] == 3
+    assert out["output"][0]["content"] == "ok"
+    assert transport.requests == 3
+    assert transport.closes == 1  # 全程一个 client（旧实现 = 3）

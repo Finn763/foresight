@@ -62,18 +62,32 @@ def should_fallback(now: datetime, closes_at: datetime, *, window_days: int = 3)
     return now - closes_at >= timedelta(days=window_days)
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=Settings().db_path)
     ap.add_argument("--dry-run", action="store_true", help="只打印判定结果，不回填")
+
+    def _error(msg: str) -> None:
+        # argparse 用法错误默认 exit 2 → 调度侧统一为 1（只有 0/1 语义）
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+
+    ap.error = _error  # type: ignore[method-assign]
     args = ap.parse_args()
 
     settings = Settings()
-    st = Storage(args.db)
-    st.create_schema()
+    try:
+        st = Storage(args.db)
+        st.create_schema()
+    except Exception as e:
+        # DuckDB 跨进程独占锁：daily/evolve 轮持锁时连接即 IOException。优雅退出
+        # exit 1（LastTaskResult 非零可查），不裸 traceback；下一轮自动重试。
+        print(f"DB 初始化失败（可能被其他轮持锁，下一轮自动重试）：{e}")
+        return 1
     now = datetime.now()
     qids = [q for q in st.source_question_ids("polymarket")]
     llm_client = None
+    llm_unavailable = False
     resolved = 0
     with httpx.Client() as http:
         for qid in qids:
@@ -103,12 +117,17 @@ def main() -> None:
                 continue
             # 超窗 → B 类 LLM 兜底。LLMResolver 内部 grace 护栏（默认 3 天）会与独占
             # 窗口叠加成零宽窗口，故 grace 推导传入：独占 window_days + 兜底宽限 3 天
-            if llm_client is None:
+            if llm_client is None and not llm_unavailable:
                 try:
                     llm_client = LLMClient(**settings.llm_client_kwargs)
                 except Exception as e:
-                    print(f"LLM 客户端构造失败（{e}），本轮兜底跳过，全部待人工/下一轮")
-                    break
+                    # 兜底不可用不得阻断剩余题的市场决议检查（此前 break 会跳过后续
+                    # 全部题，含本可市场决议的题）——置哨兵继续，仅 LLM 兜底失效
+                    print(f"LLM 客户端构造失败（{e}），本轮 LLM 兜底跳过，市场决议照常")
+                    llm_unavailable = True
+            if llm_client is None:
+                print(f"#{qid} 市场未决议且 LLM 兜底不可用（待下一轮）：{q.title}")
+                continue
             verdict = LLMResolver(llm_client, storage=st).resolve(
                 q, {**spec, "grace_days": 3 + 3}, now
             )
@@ -134,7 +153,8 @@ def main() -> None:
         except Exception as e:
             print(f"校准器刷新失败（降级）：{e}")
     print(f"本轮揭晓 {resolved} 题")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

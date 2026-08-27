@@ -80,7 +80,7 @@ fork 说明：本仓库 `shell/pi` 基于 [earendil-works/pi](https://github.com
 
 | 文件 | 用途 |
 |---|---|
-| `docs/forecastbench提交渠道调研.md` | ForecastBench 官方提交渠道调研 |
+| `docs/forecastbench-submission-survey.md` | ForecastBench 官方提交渠道调研 |
 | `shell/BRANDING.md` | pi fork 的品牌化改动清单与上游同步流程 |
 
 ## License

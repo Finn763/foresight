@@ -28,7 +28,7 @@ foresight/
 ├── tests/               # 全量单测（pytest）
 ├── data/fb_seed/        # ForecastBench 种子题库快照（回测用）
 ├── .foresight/          # agent 人格护栏 SYSTEM.md + 工具扩展 foresight-tools.ts
-├── docs/                # 技术文档（架构计划 / ForecastBench 提交渠道调研 / STATUS）
+├── docs/                # 技术文档（ForecastBench 提交渠道调研）
 └── pyproject.toml       # uv 管理的 Python 依赖（3.12+）
 ```
 
@@ -80,8 +80,6 @@ fork 说明：本仓库 `shell/pi` 基于 [earendil-works/pi](https://github.com
 
 | 文件 | 用途 |
 |---|---|
-| `docs/pi-化架构计划.md` | agent 外壳 + Python 引擎的双层架构设计与迁移记录 |
-| `docs/STATUS.md` | 项目当前状态单页总览 |
 | `docs/forecastbench提交渠道调研.md` | ForecastBench 官方提交渠道调研 |
 | `shell/BRANDING.md` | pi fork 的品牌化改动清单与上游同步流程 |
 

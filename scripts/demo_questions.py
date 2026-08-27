@@ -1,4 +1,4 @@
-"""演示案例集：M3 演示题初始化（Task 24）。
+"""演示案例集：演示题初始化。
 
 用法：
   python scripts/demo_questions.py --init        # 5 道演示题入库（is_public=TRUE）

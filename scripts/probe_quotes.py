@@ -1,4 +1,4 @@
-"""连通性探针：逐端点拉一个报价，打印结果。P0 首个任务，跑完把可用端点填进 quotes.py。
+"""连通性探针：逐端点拉一个报价，打印结果。跑完把可用端点填进 quotes.py。
 
 用法: .venv/Scripts/python.exe scripts/probe_quotes.py
 每个端点一行 HTTP 状态 + 原始响应前 120 字符；sina/tencent 另打印字段序（index: value），

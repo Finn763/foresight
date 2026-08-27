@@ -1,4 +1,4 @@
-"""Foresight 项目内自检（盯梢）：schtasks 每日 09:35/16:40 触发。
+"""Foresight 项目内自检（盯梢）：schtasks 定时触发。
 
 复用 ops 三件套（build_facts / probes / assess）红黄绿判定 + 补充 24h 事件规则。
 入场控制：复用 evolve.lock 机制排队等锁（--lock-wait 上限 45 分钟，轮次结束即接手）；

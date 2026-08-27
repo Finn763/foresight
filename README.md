@@ -12,7 +12,7 @@ Architecture = **pi-fork interactive agent shell** (`shell/pi`, renamed `@foresi
 
 ![Foresight prediction engine architecture](docs/architecture.svg)
 
-[▶ Interactive version](https://finn763.github.io/foresight/architecture.html) (pan / zoom / theme switch / focus tracing)
+[▶ Interactive version](https://finn763.github.io/foresight/architecture.html) (pan / zoom / theme switch / focus tracing) — generated with [Archify](https://github.com/tt-a1i/archify) (MIT, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md))
 
 ## Highlights
 

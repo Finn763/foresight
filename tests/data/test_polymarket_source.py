@@ -288,3 +288,131 @@ def test_main_llm_unavailable_does_not_block_market_and_rerun_idempotent(
     assert st2.get_question(q3).outcome is False
     out2 = capsys.readouterr().out
     assert "本轮揭晓 0 题" in out2
+
+
+def _load_pm_fetch():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pm_fetch", "scripts/pm_fetch.py")
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _pm_market(mid: str, *, days: float, volume: float = 100000.0) -> dict:
+    """相对当前时刻构造一个可过 select_candidates 的活跃市场（endDate 动态）。"""
+    now = datetime.now(UTC)
+    end = (now + timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    return {
+        "id": mid,
+        "slug": f"slug-{mid}",
+        "question": f"Will the {mid} market resolve Yes?",
+        "endDate": end,
+        "closed": "False",
+        "volume": str(volume),
+        "outcomes": '["Yes", "No"]',
+        "description": "resolves to Yes if ...",
+    }
+
+
+def test_pm_fetch_main_db_init_failure_returns_1(monkeypatch, capsys):
+    """DB 撞锁（Storage 构造抛异常）→ 优雅 exit 1 + 可读消息，不裸 traceback。"""
+    mod = _load_pm_fetch()
+
+    def boom(db_path, **kw):
+        raise RuntimeError("IO Error: database is locked")
+
+    monkeypatch.setattr(mod, "Storage", boom)
+    monkeypatch.setattr(sys, "argv", ["pm_fetch.py", "--db", "locked.db"])
+    assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "持锁" in out
+    assert "Traceback" not in out
+
+
+def test_pm_fetch_main_network_failure_returns_1(tmp_path, monkeypatch, capsys):
+    """事件列表网络失败 → 可读消息 + exit 1，不裸 traceback。"""
+    mod = _load_pm_fetch()
+    db = tmp_path / "pm.db"
+    st = Storage(str(db))
+    st.create_schema()
+
+    def boom(http, limit=100, offset=0):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(mod, "fetch_events", boom)
+    monkeypatch.setattr(sys, "argv", ["pm_fetch.py", "--db", str(db)])
+    assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "网络降级" in out
+    assert "Traceback" not in out
+
+
+def test_pm_fetch_main_ingest_and_rerun_idempotent(tmp_path, monkeypatch, capsys):
+    """首轮入库 1 题；重跑 market_id 判重 → 0 新题入库（幂等）。"""
+    mod = _load_pm_fetch()
+    db = tmp_path / "pm.db"
+    event = {"id": "ev1", "endDate": _pm_market("x", days=7)["endDate"]}
+    market = _pm_market("m-idem-1", days=7)
+
+    def fake_events(http, limit=100, offset=0):
+        return [event] if offset == 0 else []
+
+    def fake_markets(http, eid):
+        return [market] if eid == "ev1" else []
+
+    monkeypatch.setattr(mod, "fetch_events", fake_events)
+    monkeypatch.setattr(mod, "fetch_event_markets", fake_markets)
+    monkeypatch.setattr(
+        sys, "argv", ["pm_fetch.py", "--db", str(db), "--no-translate"]
+    )
+
+    assert mod.main() == 0  # 首轮入库 1 题
+    st2 = Storage(str(db))
+    assert st2.source_market_ids("polymarket") == {"m-idem-1"}
+    out = capsys.readouterr().out
+    assert "本轮入库 1 题" in out
+
+    assert mod.main() == 0  # 重跑：market_id 已入库 → 全部去重，不重复建题
+    assert st2.source_market_ids("polymarket") == {"m-idem-1"}
+    out2 = capsys.readouterr().out
+    assert "去重后新增 0" in out2
+    assert "本轮入库 0 题" in out2
+
+
+def test_pm_fetch_main_add_failure_degrades_gracefully(monkeypatch, capsys):
+    """入库撞锁（add_question 抛异常）→ 单题降级不击垮整轮，退出 0 不裸 traceback。"""
+    mod = _load_pm_fetch()
+    event = {"id": "ev1", "endDate": _pm_market("x", days=7)["endDate"]}
+    market = _pm_market("m-lock-1", days=7)
+
+    class FakeStorage:
+        def __init__(self, db_path):
+            pass
+
+        def create_schema(self):
+            pass
+
+        def source_market_ids(self, source):
+            return set()
+
+        def add_question(self, *a, **kw):
+            raise RuntimeError("IO Error: database is locked")
+
+    def fake_events(http, limit=100, offset=0):
+        return [event] if offset == 0 else []
+
+    def fake_markets(http, eid):
+        return [market] if eid == "ev1" else []
+
+    monkeypatch.setattr(mod, "Storage", FakeStorage)
+    monkeypatch.setattr(mod, "fetch_events", fake_events)
+    monkeypatch.setattr(mod, "fetch_event_markets", fake_markets)
+    monkeypatch.setattr(sys, "argv", ["pm_fetch.py", "--db", "x.db", "--no-translate"])
+
+    assert mod.main() == 0  # 整轮跑完（降级不算失败），不裸 traceback
+    out = capsys.readouterr().out
+    assert "降级" in out
+    assert "Traceback" not in out
+    assert "本轮入库 0 题" in out

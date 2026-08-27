@@ -35,7 +35,7 @@ from predictor.data.storage import Storage
 from predictor.llm.client import LLMClient
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=Settings().db_path)
     ap.add_argument("--max-events", type=int, default=500, help="分页扫描事件数上限（保护）")
@@ -44,12 +44,25 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="只打印候选，不翻译不落库")
     ap.add_argument("--public", action="store_true", help="入库为公开题（默认内部题）")
     ap.add_argument("--no-translate", action="store_true", help="跳过翻译，保留英文题面")
+
+    def _error(msg: str) -> None:
+        # argparse 用法错误默认 exit 2 → 调度侧统一为 1（只有 0/1 语义）
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+
+    ap.error = _error  # type: ignore[method-assign]
     args = ap.parse_args()
 
     settings = Settings()
-    st = Storage(args.db)
-    st.create_schema()
-    known = st.source_market_ids("polymarket")
+    try:
+        st = Storage(args.db)
+        st.create_schema()
+        known = st.source_market_ids("polymarket")
+    except Exception as e:
+        # DuckDB 跨进程独占锁：daily/evolve 轮持锁时连接即 IOException。优雅退出
+        # exit 1（LastTaskResult 非零可查），不裸 traceback；下一轮自动重试。
+        print(f"DB 初始化失败（可能被其他轮持锁，下一轮自动重试）：{e}")
+        return 1
 
     horizon_end = datetime.now(UTC) + timedelta(days=90)  # 只扫长档窗口内的事件
     with httpx.Client() as http:
@@ -75,8 +88,10 @@ def main() -> None:
                     f"建议提高 --max-events"
                 )
         except Exception as e:
+            # 网络失败整轮终止：可读消息 + exit 1（LastTaskResult 非零可查），
+            # 不裸 traceback；幂等语义不受影响（本轮未入库任何题）。
             print(f"事件列表拉取失败（网络降级，本轮终止）：{e}")
-            return
+            return 1
         # 并发拉各事件的 markets（8 线程；单事件失败跳过，不阻塞整轮）
         markets: list[dict] = []
         with ThreadPoolExecutor(max_workers=8) as ex:
@@ -125,17 +140,24 @@ def main() -> None:
             "url": c.url,
             "resolution_criteria": c.description,
         }
-        qid = st.add_question(
-            title,
-            c.closes_at,
-            is_public=args.public,
-            resolution_class="B",  # 混合揭晓：市场决议优先，B 类 LLM 兜底
-            resolution_spec=spec,
-        )
+        try:
+            qid = st.add_question(
+                title,
+                c.closes_at,
+                is_public=args.public,
+                resolution_class="B",  # 混合揭晓：市场决议优先，B 类 LLM 兜底
+                resolution_spec=spec,
+            )
+        except Exception as e:
+            # 并发锁/DB 异常只降级本题（与 pm_resolve 同纪律），不击垮整轮；
+            # 已入库题不受影响，未入库题 market_id 判重保证下一轮重试不重复。
+            print(f"  入库失败（降级，待下一轮）：{e}（{title}）")
+            continue
         print(f"  #{qid} [{c.closes_at:%Y-%m-%d}] vol=${c.volume:,.0f} {title}")
         added += 1
     print(f"本轮入库 {added} 题")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

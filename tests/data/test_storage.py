@@ -1,10 +1,21 @@
 """Storage 真实 DuckDB 跑 CRUD + 揭晓回填 Brier + 分桶统计。"""
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
+import predictor.data.storage as storage_mod
 from predictor.data.storage import Storage
+
+
+@pytest.fixture(autouse=True)
+def _pin_model_settings(monkeypatch):
+    """CC §2.3③：resolve 写 model_stats 前经 canonical_model_name 读 Settings——
+    钉死配置，避免本机 .env 的 DEEPSEEK_MODEL 影响断言（测试可复现性）。"""
+    monkeypatch.setattr(
+        storage_mod, "_load_settings", lambda: SimpleNamespace(deepseek_model="deepseek-chat")
+    )
 
 
 @pytest.fixture()
@@ -196,3 +207,174 @@ def test_add_document_not_null_violation_still_raises(storage):
     qid = storage.add_question("坏数据题", datetime.now() + timedelta(days=5))
     with pytest.raises(Exception):
         storage.add_document(qid, None, "http://x/3", "t", "c", published_at=None)
+
+
+# ---- CC §2.3① 题族分桶 + §2.3② brier_ema 归属修正（2026-08-27）----
+
+
+def test_brier_by_family_buckets_instrument_category_and_unknown(storage):
+    """题族维度：instrument（A 类行情网格）→ category（autopick）→ unclassified 兜底；
+    口径与 horizon 桶一致（is_public + outcome 非空），非公开题不进。"""
+    q1 = storage.add_question(
+        "标普题",
+        datetime.now() + timedelta(days=3),
+        resolution_class="A",
+        resolution_spec={"class": "A", "instrument": "spx", "condition": "gt_prev_close"},
+    )
+    storage.add_prediction(q1, 0.9, evidence_ids=[1], model_runs={})
+    storage.resolve_question(q1, True, "s")
+
+    q2 = storage.add_question(
+        "黄金题",
+        datetime.now() + timedelta(days=3),
+        resolution_class="A",
+        resolution_spec={"class": "A", "instrument": "gold", "condition": "gt_threshold"},
+    )
+    storage.add_prediction(q2, 0.7, evidence_ids=[1], model_runs={})
+    storage.resolve_question(q2, False, "s")
+
+    q3 = storage.add_question(
+        "autopick 题",
+        datetime.now() + timedelta(days=3),
+        resolution_class="B",
+        resolution_spec={
+            "class": "B",
+            "source": "autopick",
+            "event_key": "x-y-z",
+            "category": "central_bank",
+        },
+    )
+    storage.add_prediction(q3, 0.8, evidence_ids=[1], model_runs={})
+    storage.resolve_question(q3, True, "s")
+
+    q4 = storage.add_question(
+        "旧 B 类题",
+        datetime.now() + timedelta(days=3),
+        resolution_class="B",
+        resolution_spec={"class": "B"},  # 无 instrument/category → unclassified
+    )
+    storage.add_prediction(q4, 0.6, evidence_ids=[1], model_runs={})
+    storage.resolve_question(q4, False, "s")
+
+    q5 = storage.add_question("无 spec 题", datetime.now() + timedelta(days=3))
+    storage.add_prediction(q5, 0.5, evidence_ids=[1], model_runs={})
+    storage.resolve_question(q5, True, "s")
+
+    # 非公开题（回测口径）：计分但绝不进对外族桶
+    q6 = storage.add_question(
+        "非公开道琼斯题",
+        datetime.now() + timedelta(days=3),
+        resolution_class="A",
+        resolution_spec={"class": "A", "instrument": "dji"},
+        is_public=False,
+    )
+    storage.add_prediction(q6, 0.5, evidence_ids=[1], model_runs={})
+    storage.resolve_question(q6, True, "s")
+
+    fams = {f["family"]: f for f in storage.brier_by_family()}
+    assert fams["spx"]["n"] == 1
+    assert fams["spx"]["brier_mean"] == pytest.approx((0.9 - 1.0) ** 2)
+    assert fams["gold"]["n"] == 1
+    assert fams["gold"]["brier_mean"] == pytest.approx((0.7 - 0.0) ** 2)
+    assert fams["central_bank"]["n"] == 1
+    assert fams["central_bank"]["brier_mean"] == pytest.approx((0.8 - 1.0) ** 2)
+    assert fams["unclassified"]["n"] == 2  # 旧 B 类（无 instrument/category）+ 无 spec
+    assert "dji" not in fams  # is_public=False 不进对外族桶
+    assert sum(f["n"] for f in fams.values()) == 5  # 与已揭晓公开题数对账
+    assert all(f["unreliable"] for f in fams.values())  # n<30 全部标 unreliable
+
+    # scoreboard_summary 携带 families 维度（/api/scoreboard 对外契约，纯增量字段）
+    summary = storage.scoreboard_summary()
+    assert summary["resolved"] == 5
+    assert {f["family"] for f in summary["families"]} == {
+        "spx",
+        "gold",
+        "central_bank",
+        "unclassified",
+    }
+
+
+def test_model_stats_brier_ema_single_owner(storage):
+    """CC §2.3②：单模型 model_runs → brier_ema 归属该模型名（经配置化转名）。"""
+    qid = storage.add_question("单模型题", datetime.now() + timedelta(days=5))
+    storage.add_prediction(qid, 0.7, evidence_ids=[1], model_runs={"deepseek-chat": [0.7]})
+    storage.resolve_question(qid, True, "s")
+    stats = storage.model_stats()
+    assert [s["model_name"] for s in stats] == ["deepseek-chat"]  # 钉死默认配置 → 原名
+    assert stats[0]["predictions"] == 1
+    assert stats[0]["brier_ema"] == pytest.approx((0.7 - 1.0) ** 2)
+
+
+def test_model_stats_brier_ema_multi_model_goes_to_ensemble(storage):
+    """CC §2.3②：多模型 model_runs → 同一管线 Brier 不再分摊给所有模型名，
+    归属保留名 'ensemble'（管线最终概率无单一模型可归属）。"""
+    qid = storage.add_question("多模型题", datetime.now() + timedelta(days=5))
+    storage.add_prediction(
+        qid,
+        0.8,
+        evidence_ids=[1],
+        model_runs={"model-a": [0.8], "model-b": [0.8]},
+    )
+    storage.resolve_question(qid, False, "s")
+    stats = storage.model_stats()
+    assert [s["model_name"] for s in stats] == ["ensemble"]
+    assert stats[0]["predictions"] == 1
+    assert stats[0]["brier_ema"] == pytest.approx((0.8 - 0.0) ** 2)
+
+
+def test_model_stats_canonicalizes_legacy_hardcoded_names(storage, monkeypatch):
+    """CC §2.3③：resolve 写 model_stats 不再信任传入的硬编码名，从 Settings 读
+    配置模型名（.env 换模型后统计标签跟随配置，与真实模型不再脱钩）。"""
+    monkeypatch.setattr(
+        storage_mod,
+        "_load_settings",
+        lambda: SimpleNamespace(deepseek_model="deepseek-v4-pro"),
+    )
+    q1 = storage.add_question("经典管线题", datetime.now() + timedelta(days=5))
+    storage.add_prediction(q1, 0.7, evidence_ids=[1], model_runs={"deepseek-chat": [0.7]})
+    storage.resolve_question(q1, True, "s")
+
+    q2 = storage.add_question("websearch 题", datetime.now() + timedelta(days=5))
+    storage.add_prediction(
+        q2,
+        0.3,
+        evidence_ids=[1],
+        model_runs={"deepseek-flash-websearch": [0.3]},
+        arm="websearch",
+    )
+    storage.resolve_question(q2, True, "s")
+
+    q3 = storage.add_question("自定义模型题", datetime.now() + timedelta(days=5))
+    storage.add_prediction(q3, 0.5, evidence_ids=[1], model_runs={"my-model": [0.5]})
+    storage.resolve_question(q3, True, "s")
+
+    stats = {s["model_name"]: s for s in storage.model_stats()}
+    # 两个历史硬编码名映射到同一配置模型名（同一客户端）→ 合并进同一行
+    assert "deepseek-chat" not in stats
+    assert "deepseek-flash-websearch" not in stats
+    assert stats["deepseek-v4-pro"]["predictions"] == 2
+    assert stats["deepseek-v4-pro"]["brier_ema"] == pytest.approx(
+        ((0.7 - 1.0) ** 2 * 9 + (0.3 - 1.0) ** 2) / 10  # EMA α=0.1 递推
+    )
+    assert stats["my-model"]["predictions"] == 1  # 已配置名原样保留
+    assert stats["my-model"]["brier_ema"] == pytest.approx((0.5 - 1.0) ** 2)
+
+
+def test_model_stats_empty_model_runs_not_recorded(storage):
+    """model_runs 为空 → 不写 model_stats（现状基线，保持）。"""
+    qid = storage.add_question("空 runs 题", datetime.now() + timedelta(days=5))
+    storage.add_prediction(qid, 0.7, evidence_ids=[1], model_runs={})
+    storage.resolve_question(qid, True, "s")
+    assert storage.model_stats() == []
+
+
+def test_model_stats_non_dict_model_runs_logged_not_raised(storage):
+    """model_runs 非对象（JSON null）→ 既有降级契约：brier 照常落库、stats 跳过、
+    evolution_log 记 resolution_brier_failed，不向上抛（揭晓轮不崩）。"""
+    qid = storage.add_question("异常 runs 题", datetime.now() + timedelta(days=5))
+    storage.add_prediction(qid, 0.7, evidence_ids=[1], model_runs=None)
+    storage.resolve_question(qid, True, "s")  # 不得抛异常
+    assert storage.brier_latest(qid) == pytest.approx((0.7 - 1.0) ** 2)
+    assert storage.model_stats() == []
+    evs = storage._conn.execute("SELECT event_type FROM evolution_log").fetchall()
+    assert [e[0] for e in evs] == ["resolution_brier_failed"]

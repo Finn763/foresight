@@ -20,6 +20,54 @@ class Question:
     is_public: bool
 
 
+# ---- 模型名配置化（CC §2.3③ 落点，2026-08-27）----
+# 所有预测路径（cli.py / scripts/daily.py / scripts/backtest.py）统一用
+# Settings.llm_client_kwargs 构造 LLMClient，即真实产出预测的模型恒为
+# Settings().deepseek_model。pipeline.py:137 与 websearch_predictor.py 写入
+# model_runs 的键仍是历史硬编码（"deepseek-chat" / "deepseek-flash-websearch"，
+# 两文件不在本任务边界）：storage 侧记录 model_stats 时不再信任传入的硬编码名，
+# 统一从 Settings 解析，.env 换模型后统计标签不再与实际脱钩。
+
+_LEGACY_MODEL_HARDCODES = frozenset({"deepseek-chat", "deepseek-flash-websearch"})
+
+# 多模型 model_runs 时 brier_ema 的归属名（管线最终概率无单一模型可归属，CC §2.3②）
+_ENSEMBLE_OWNER = "ensemble"
+
+
+def _load_settings():
+    """Settings 工厂（独立函数，便于测试 monkeypatch 钉死配置）。"""
+    from predictor.config import Settings
+
+    return Settings()
+
+
+def get_model_name() -> str:
+    """真实产出预测的模型名（单一事实源：Settings().deepseek_model）。
+
+    供 pipeline.py / websearch_predictor.py 后续切换：model_runs 的键应直接用本函数
+    返回值而非硬编码字符串（两文件不在本任务边界，暂由 canonical_model_name 兜底）。
+    """
+    return _load_settings().deepseek_model
+
+
+def canonical_model_name(name: str) -> str:
+    """历史硬编码模型名 → 配置模型名（CC §2.3③）。
+
+    "deepseek-chat"（pipeline.py:137）与 "deepseek-flash-websearch"
+    （websearch_predictor.py）实际都跑在 Settings().deepseek_model 上（预测路径
+    共用同一客户端），统一映射到配置值；其他名字视为已配置名原样保留（未来真多
+    模型时调用方直接写入 get_model_name() 的返回值即可）。Settings 不可用或配置
+    为空时回退原名，不阻塞揭晓（model_stats 只影响在线权重）。
+    """
+    if name not in _LEGACY_MODEL_HARDCODES:
+        return name
+    try:
+        configured = get_model_name()
+    except Exception:
+        return name
+    return configured or name
+
+
 class Storage:
     def __init__(self, db_path: str, *, read_only: bool = False):
         if db_path != ":memory:":
@@ -284,14 +332,17 @@ class Storage:
                 "             ORDER BY created_at DESC, id DESC LIMIT 1)",
                 [int(outcome), int(outcome), question_id],
             )
-            # 在线权重（EMA α=0.1）：model_stats 不再闲置，按 model_runs 里的模型名逐行 upsert
+            # 在线权重（EMA α=0.1）：model_stats 按 brier_ema 归属口径（CC §2.3②修正）
+            # 写入——brier 是「管线最终概率」（ensemble+extremize+校准后）的 Brier：
+            # 单模型（现状）归属该模型名（canonical_model_name 转配置名，CC §2.3③）；
+            # 多模型集成归属保留名 'ensemble'，不再把同一 Brier 分摊给所有模型名。
             rows = self._conn.execute(
                 "SELECT model_runs, brier_score FROM predictions "
                 "WHERE question_id = ? AND brier_score IS NOT NULL",
                 [question_id],
             ).fetchall()
             for mr_json, brier in rows:
-                for mname in json.loads(mr_json or "{}"):
+                for mname in self._brier_owner_names(mr_json):
                     self._conn.execute(
                         "INSERT INTO model_stats (model_name, predictions, brier_ema, last_updated) "
                         "VALUES (?, 1, ?, CURRENT_TIMESTAMP) "
@@ -318,6 +369,31 @@ class Storage:
                 )
             except Exception:
                 pass
+
+    @staticmethod
+    def _brier_owner_names(model_runs_json: str | None) -> list[str]:
+        """brier_ema 归属的模型名列表（CC §2.3②修正，2026-08-27）。
+
+        - 空 dict / SQL NULL（model_runs 未记录）→ []（不写 stats）；
+        - 损坏 / 非对象（如 JSON null）→ raise：沿用既有降级契约——resolve_question
+          计分段 catch 后记 resolution_brier_failed，暴露残缺可人工后补；
+        - 恰好一个模型键（现状：单模型多采样集成）→ 该键经 canonical_model_name
+          转为配置模型名（CC §2.3③）；
+        - 多个模型键（未来真多模型集成）→ ['ensemble']：管线最终概率不归属任何
+          单一模型，逐个分摊同一 Brier 是语义失真。
+        """
+        try:
+            mr = json.loads(model_runs_json or "{}")
+        except Exception as e:
+            raise ValueError(f"model_runs JSON 损坏: {e}") from None
+        if not isinstance(mr, dict):
+            raise ValueError(f"model_runs 非对象: {type(mr).__name__}")
+        names = [k for k in mr if isinstance(k, str) and k]
+        if not names:
+            return []
+        if len(names) == 1:
+            return [canonical_model_name(names[0])]
+        return [_ENSEMBLE_OWNER]
 
     # ---- predictions ----
     def add_prediction(
@@ -553,6 +629,57 @@ class Storage:
                 }
             )
         return out
+
+    def brier_by_family(self) -> list[dict]:
+        """按题族分桶统计已揭晓公开题战绩（CC §2.3①，2026-08-27）。
+
+        族 key 推导：resolution_spec.instrument（A 类行情网格题族，与
+        selection/families.py 的族 key 同构）→ resolution_spec.category
+        （autopick 主题族）→ 'unclassified' 兜底（旧 B 类题 spec 仅 {"class":"B"}）。
+        口径与 brier_by_horizon_bucket 一致：brier_score IS NOT NULL
+        + is_public + outcome IS NOT NULL；n<30 标 unreliable。
+        """
+        rows = self._conn.execute("""
+            WITH p AS (
+                SELECT p.brier_score AS b,
+                       CASE
+                           WHEN json_valid(q.resolution_spec) THEN
+                               COALESCE(
+                                   NULLIF(
+                                       TRIM(
+                                           json_extract_string(
+                                               q.resolution_spec, '$.instrument'
+                                           )
+                                       ),
+                                       ''
+                                   ),
+                                   NULLIF(
+                                       TRIM(
+                                           json_extract_string(
+                                               q.resolution_spec, '$.category'
+                                           )
+                                       ),
+                                       ''
+                                   )
+                               )
+                       END AS family
+                FROM predictions p JOIN questions q ON q.id = p.question_id
+                WHERE p.brier_score IS NOT NULL AND q.is_public AND q.outcome IS NOT NULL
+            )
+            SELECT COALESCE(family, 'unclassified') AS family,
+                   COUNT(*) AS n,
+                   AVG(b) AS brier_mean
+            FROM p GROUP BY 1 ORDER BY 1
+        """).fetchall()
+        return [
+            {
+                "family": family,
+                "n": int(n),
+                "brier_mean": float(brier_mean),
+                "unreliable": n < 30,
+            }
+            for family, n, brier_mean in rows
+        ]
 
     def model_stats(self) -> list[dict]:
         rows = self._conn.execute(
@@ -851,6 +978,7 @@ class Storage:
         """).fetchone()
         d = dict(zip(["resolved", "brier_mean", "first_resolved_at", "last_resolved_at"], row))
         d["buckets"] = self.brier_by_horizon_bucket()
+        d["families"] = self.brier_by_family()  # CC §2.3①：题族维度分桶
         return d
 
     def public_summary(self) -> dict:

@@ -8,8 +8,9 @@ DuckDB 在 Windows 上排他文件访问，任何常驻连接都会阻塞每日 
 
 from html import escape
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -242,8 +243,18 @@ def _register_internal(app: FastAPI, db_dep) -> None:
         return {"latest": _latest_unack_alert(_alerts_dir(app.state.db_path))}
 
     @app.post("/api/ops/alerts/ack")
-    def ops_alerts_ack():
-        """确认告警：最新未确认告警文件改名 .ack.md（退出横幅），303 回首页。"""
+    def ops_alerts_ack(origin: str | None = Header(default=None),
+                       host: str | None = Header(default=None)):
+        """确认告警：最新未确认告警文件改名 .ack.md（退出横幅），303 回首页。
+
+        CSRF 防护（评审新问题#3）：浏览器跨源表单会带 Origin——存在且主机与
+        本请求 Host 不一致时拒绝；无 Origin 的本地调用（curl/同源浏览器）放行。
+        """
+        if origin:
+            oh = urlsplit(origin).hostname
+            rh = (host or "").split(":")[0]
+            if oh and rh and oh != rh:
+                return JSONResponse(status_code=403, content={"detail": "cross-origin ack rejected"})
         info = _latest_unack_alert(_alerts_dir(app.state.db_path))
         if info is not None:
             f = _alerts_dir(app.state.db_path) / info["file"]

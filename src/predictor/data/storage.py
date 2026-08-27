@@ -204,7 +204,19 @@ class Storage:
         # 独立方法而非 SQL 串：UPDATE...FROM + FIRST() OVER 窗口在 DuckDB 1.5.5 的
         # 多语句批处理中第二次执行会触发内部错误（optional pointer），Python 侧
         # MIN_BY 聚合 + 逐组更新/删除是稳定的等价实现。
-        self._migrate_source_documents_unique()
+        try:
+            self._migrate_source_documents_unique()
+        except Exception as e:
+            # 评审新问题#1：create_schema 是全部写入口（daily/evolve/predict/health）
+            # 的必经之路——迁移异常必须降级跳过、留痕，不得打停建库。
+            # 幂等设计下唯一索引尚未建成时，下次启动会重试。
+            import sys
+
+            print(
+                f"[storage] source_documents 去重迁移失败（跳过，下次启动重试）: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
 
     def _migrate_source_documents_unique(self) -> None:
         """历史重复 (question_id,url) 清理 + 唯一索引（幂等，随 create_schema 执行）。

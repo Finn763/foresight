@@ -23,6 +23,36 @@ DEFAULT_KEEP_DAYS = 7
 _ROOT = Path(__file__).resolve().parents[1]
 
 
+class BackupSkipped(Exception):
+    """持锁跳过备份（正常防御行为，非故障）。"""
+
+
+def _lock_active(db_path: Path) -> bool:
+    """evolve.lock 被存活进程持有 → 跳过备份（避免拷出撕裂副本，评审新问题#2）。"""
+    try:
+        sys.path.insert(0, str(_ROOT / "src"))
+        from predictor.ops.lock import lock_state
+
+        return lock_state(db_path.parent / "evolve.lock") == "active"
+    except Exception:
+        return False  # 锁检查本身失败不阻断备份；完整性验证兜底
+
+
+def _verify_copy(dest: Path) -> None:
+    """副本完整性验证：read_only 打开 + 探一行。打不开即删除副本并上抛。"""
+    try:
+        import duckdb
+
+        con = duckdb.connect(str(dest), read_only=True)
+        try:
+            con.execute("SELECT count(*) FROM questions").fetchone()
+        finally:
+            con.close()
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+
+
 def backup_db(db_path: Path, backup_dir: Path, now: datetime) -> Path:
     """文件拷贝备份：db_path → backup_dir/foresight-YYYYMMDD-HHMM.db。
 
@@ -31,9 +61,12 @@ def backup_db(db_path: Path, backup_dir: Path, now: datetime) -> Path:
     """
     if not db_path.is_file():
         raise FileNotFoundError(f"DB 不存在：{db_path}")
+    if _lock_active(db_path):
+        raise BackupSkipped("evolve.lock 由存活进程持有，跳过备份（避免撕裂副本）")
     backup_dir.mkdir(parents=True, exist_ok=True)
     dest = backup_dir / f"foresight-{now:%Y%m%d-%H%M}.db"
     shutil.copy2(db_path, dest)
+    _verify_copy(dest)
     return dest
 
 
@@ -71,6 +104,9 @@ def main(argv=None) -> int:
 
     try:
         dest = backup_db(db, backup_dir, now)
+    except BackupSkipped as e:
+        print(f"BACKUP-SKIP: {e}")
+        return 0  # 持锁跳过属防御行为，非故障
     except (FileNotFoundError, OSError) as e:
         print(f"BACKUP-FAIL: {type(e).__name__}: {e}")
         return 1

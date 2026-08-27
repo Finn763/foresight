@@ -45,7 +45,7 @@ def test_ensure_question_families_returns_new_ids_for_immediate_prediction():
 def test_manual_candidates_excludes_valid_auto_a_and_includes_b_c_invalid():
     """8-14 预演前对抗审计：到期未揭晓的人工清单只收"无法自动揭晓"的题——
     合法 A 类由 16:30 auto_resolve 处理，若列进人工清单会被在行情出现前填表判死。"""
-    from scripts.daily import _manual_candidates
+    from predictor.ops.manual import manual_candidates
 
     st = Storage(":memory:")
     st.create_schema()
@@ -76,7 +76,7 @@ def test_manual_candidates_excludes_valid_auto_a_and_includes_b_c_invalid():
     qi = st.add_question(
         "非法A题", now - timedelta(days=1), resolution_class="A", resolution_spec=invalid_a
     )
-    ids = {q.id for q in _manual_candidates(st, now)}
+    ids = {q.id for q in manual_candidates(st, now)}
     assert qa not in ids, "合法 A 类自动题不得进人工清单"
     assert {qb, qc, qn, qi} <= ids
 

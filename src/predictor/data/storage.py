@@ -89,7 +89,13 @@ class Storage:
             -- ---- 自我进化闭环：5 张新表 ----
             CREATE TABLE IF NOT EXISTS curated_documents (
                 id INTEGER PRIMARY KEY DEFAULT nextval('seq_documents'),
-                document_id INTEGER REFERENCES source_documents(id),
+                -- 注意：不加 REFERENCES source_documents(id)。DuckDB 1.5.5 实测：
+                -- 旧库已存在无 FK 的 curated_documents 时，带 REFERENCES 的
+                -- CREATE TABLE IF NOT EXISTS 被跳过后，对 source_documents 的任何
+                -- DELETE 都会触发内部错误（optional pointer，幻影 FK 注册 bug）。
+                -- DuckDB 默认不强制外键（未开 foreign_keys pragma），移除无行为影响；
+                -- 生产库旧表已注册的 FK 保留不动。详见 _migrate_source_documents_unique。
+                document_id INTEGER,
                 value_score DOUBLE NOT NULL,
                 impact_dir TEXT,              -- support/against/neutral
                 impact_strength INTEGER,
@@ -146,6 +152,50 @@ class Storage:
                 detail TEXT
             );
         """)
+        # CC §2.7① 证据表去重迁移（2026-08-27）：见 _migrate_source_documents_unique。
+        # 独立方法而非 SQL 串：UPDATE...FROM + FIRST() OVER 窗口在 DuckDB 1.5.5 的
+        # 多语句批处理中第二次执行会触发内部错误（optional pointer），Python 侧
+        # MIN_BY 聚合 + 逐组更新/删除是稳定的等价实现。
+        self._migrate_source_documents_unique()
+
+    def _migrate_source_documents_unique(self) -> None:
+        """历史重复 (question_id,url) 清理 + 唯一索引（幂等，随 create_schema 执行）。
+
+        口径：按 (question_id,url) 分组保留一行——content 非空优先（「可溯源」优先保
+        正文），全空则任意一行；url IS NULL 不参与（无 URL 可比对，DuckDB 唯一索引
+        视 NULL 互异本就不拦截）。curated_documents 对被清理行的引用先重定向到保留行。
+        生产库 2026-08-27 实测 55 组重复（每组 2 行，多余 55 行）、curated_documents
+        0 行；本方法随生产下次启动 create_schema 时执行（由用户择时，不直接对生产库写）。
+        """
+        has_index = self._conn.execute(
+            "SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = "
+            "'uq_source_documents_qid_url' AND table_name = 'source_documents' AND is_unique"
+        ).fetchone()[0]
+        if has_index:
+            return  # 唯一索引已建 → 重复行不可能存在，清理无需再跑
+        groups = self._conn.execute("""
+            SELECT question_id, url,
+                   MIN_BY(id, CASE WHEN content IS NULL OR content = '' THEN 1 ELSE 0 END) AS keep_id
+            FROM source_documents WHERE url IS NOT NULL
+            GROUP BY question_id, url
+        """).fetchall()
+        for question_id, url, keep_id in groups:
+            # 重定向 curated 引用（防御性；生产 0 行）
+            self._conn.execute(
+                "UPDATE curated_documents SET document_id = ? WHERE document_id IN ("
+                "  SELECT id FROM source_documents WHERE question_id IS NOT DISTINCT FROM ? "
+                "  AND url IS NOT DISTINCT FROM ? AND id <> ?)",
+                [keep_id, question_id, url, keep_id],
+            )
+            self._conn.execute(
+                "DELETE FROM source_documents WHERE question_id IS NOT DISTINCT FROM ? "
+                "AND url IS NOT DISTINCT FROM ? AND id <> ?",
+                [question_id, url, keep_id],
+            )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_source_documents_qid_url "
+            "ON source_documents(question_id, url)"
+        )
 
     # ---- questions ----
     def add_question(
@@ -297,7 +347,8 @@ class Storage:
         )
         return cur.fetchone()[0]
 
-    # ---- documents（append-only）----
+    # ---- documents（append-only；(question_id,url) 唯一索引——7 天重预测会重复抓取
+    # 同一 URL，INSERT OR IGNORE 复用既有行，evidence_ids 恒指向真实存在的文档）----
     def add_document(
         self,
         question_id: int,
@@ -310,11 +361,27 @@ class Storage:
         fetched_at: datetime | None = None,
     ) -> int:
         cur = self._conn.execute(
-            "INSERT INTO source_documents (question_id, source, url, title, content, "
+            "INSERT OR IGNORE INTO source_documents (question_id, source, url, title, content, "
             "published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
             [question_id, source, url, title, content, published_at, fetched_at or datetime.now()],
         )
-        return cur.fetchone()[0]
+        row = cur.fetchone()
+        if row is not None:
+            return row[0]
+        # 冲突 = (question_id,url) 已存在。DuckDB 1.5.5 实测 INSERT OR IGNORE 只吞
+        # 唯一性冲突（NOT NULL/CHECK 违反仍抛异常，不会静默丢证据行）→ 返回既有行 id。
+        row = self._conn.execute(
+            "SELECT id FROM source_documents WHERE question_id = ? "
+            "AND url IS NOT DISTINCT FROM ? ORDER BY id LIMIT 1",
+            [question_id, url],
+        ).fetchone()
+        if row is None:
+            # 理论不可达：IGNORE 吞掉的行必然存在（url IS NULL 不触发唯一冲突）。
+            # 防御性兜底——宁可崩也不返回假 id 污染 evidence_ids。
+            raise RuntimeError(
+                f"INSERT OR IGNORE 冲突但找不到既有行: question_id={question_id} url={url!r}"
+            )
+        return row[0]
 
     # ---- 计分口径（技能桶只用 latest）----
     def _brier_latest_id(self, question_id: int):

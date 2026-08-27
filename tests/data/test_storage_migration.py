@@ -123,3 +123,91 @@ def test_migrate_script_idempotent_on_old_schema(tmp_path):
     # 存量回填
     rows = st._conn.execute("SELECT arm FROM predictions").fetchall()
     assert rows == [("baseline",)]
+
+
+def test_migrate_dedups_legacy_source_documents(tmp_path):
+    """CC §2.7①：旧库无 (question_id,url) 唯一约束且已有重复行 → create_schema
+    幂等清理（content 非空优先保留）+ curated 引用重定向 + 唯一索引，之后重复插入被忽略。"""
+    import duckdb
+
+    old = tmp_path / "dup.db"
+    conn = duckdb.connect(str(old))
+    conn.execute("""
+        CREATE SEQUENCE seq_questions START 1;
+        CREATE SEQUENCE seq_predictions START 1;
+        CREATE SEQUENCE seq_documents START 1;
+        CREATE TABLE questions (
+            id INTEGER PRIMARY KEY DEFAULT nextval('seq_questions'),
+            title TEXT NOT NULL,
+            opens_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            closes_at TIMESTAMP NOT NULL,
+            outcome_type TEXT NOT NULL DEFAULT 'binary',
+            outcome BOOLEAN,
+            resolved_at TIMESTAMP,
+            resolution_source TEXT,
+            is_public BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE predictions (
+            id INTEGER PRIMARY KEY DEFAULT nextval('seq_predictions'),
+            question_id INTEGER NOT NULL,
+            probability DOUBLE NOT NULL,
+            brier_score DOUBLE,
+            evidence_ids JSON NOT NULL,
+            model_runs JSON,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE source_documents (
+            id INTEGER PRIMARY KEY DEFAULT nextval('seq_documents'),
+            question_id INTEGER,
+            source TEXT NOT NULL,
+            url TEXT, title TEXT, content TEXT,
+            published_at TIMESTAMP,
+            fetched_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE model_stats (
+            model_name TEXT PRIMARY KEY, predictions INTEGER NOT NULL DEFAULT 0,
+            brier_ema DOUBLE, last_updated TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE curated_documents (
+            id INTEGER PRIMARY KEY DEFAULT nextval('seq_documents'),
+            document_id INTEGER,
+            value_score DOUBLE NOT NULL,
+            impact_dir TEXT,
+            impact_strength INTEGER,
+            curated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            reason TEXT
+        );
+        INSERT INTO questions (title, opens_at, closes_at) VALUES
+            ('旧题', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP + INTERVAL 1 DAY);
+        INSERT INTO source_documents (question_id, source, url, title, content) VALUES
+            (1, 'gdelt', 'http://dup', 't1', ''),       -- id=1 空 content
+            (1, 'gdelt', 'http://dup', 't2', '正文'),    -- id=2 有 content → 保留
+            (1, 'gdelt', 'http://dup', 't3', ''),       -- id=3 清理
+            (1, 'gdelt', NULL, '无url', 'c'),           -- id=4 url NULL 不参与去重
+            (1, 'gdelt', NULL, '无url2', 'c'),          -- id=5 保留
+            (1, 'gdelt', 'http://other', 't4', '唯一');  -- id=6 保留
+        INSERT INTO curated_documents (document_id, value_score) VALUES (3, 0.5);
+    """)
+    conn.close()
+    st = Storage(str(old))
+    st.create_schema()
+    rows = st._conn.execute(
+        "SELECT id, url, title, content FROM source_documents ORDER BY id"
+    ).fetchall()
+    kept_dup = [r for r in rows if r[1] == "http://dup"]
+    assert kept_dup == [(2, "http://dup", "t2", "正文")]  # 每组只留 content 非空行
+    assert [(r[0], r[1]) for r in rows if r[1] is None] == [(4, None), (5, None)]
+    assert (6, "http://other") in [(r[0], r[1]) for r in rows]
+    # curated 对被清理行（id=3）的引用重定向到保留行（id=2）
+    cur = st._conn.execute("SELECT document_id FROM curated_documents").fetchall()
+    assert cur == [(2,)]
+    # 唯一索引已建 + 重复插入被忽略（返回保留行 id）
+    idx = st._conn.execute(
+        "SELECT is_unique FROM duckdb_indexes() WHERE table_name='source_documents'"
+    ).fetchall()
+    assert any(u for (u,) in idx)
+    assert st.add_document(1, "gdelt", "http://dup", "t9", "新", published_at=None) == 2
+    # 幂等：再跑 create_schema 不报错、行数不变
+    st.create_schema()
+    assert st._conn.execute("SELECT COUNT(*) FROM source_documents").fetchone()[0] == 4

@@ -6,16 +6,95 @@
 DuckDB 在 Windows 上排他文件访问，任何常驻连接都会阻塞每日 evolve 写轮。
 """
 
+from html import escape
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from predictor.config import Settings
 from predictor.data.storage import Storage
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+_BANNER_MARKER = '<main id="app"></main>'
+
+
+def _alerts_dir(db_path: str) -> Path:
+    """告警目录：data/alerts/（与 health_check 落盘处一致）。"""
+    return Path(db_path).parent / "alerts"
+
+
+def _latest_unack_alert(alerts_dir: Path) -> dict | None:
+    """最新未确认告警（评审 §3.5 告警消费）：文件名时间序取最后一条，跳过 .ack.md。
+
+    解析标题/检出时间/告警要点；error 类文件（无「## 告警」小节）取检出时间后的
+    首段描述作要点。任何读取失败返回 None（横幅缺席，不影响页面本身）。
+    """
+    try:
+        files = [p for p in sorted(alerts_dir.glob("alert-*.md")) if not p.stem.endswith(".ack")]
+    except OSError:
+        return None
+    if not files:
+        return None
+    f = files[-1]
+    try:
+        lines = f.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    title = next((ln[2:].strip() for ln in lines if ln.startswith("# ")), f.name)
+    detected = next(
+        (ln.split("：", 1)[1].strip() for ln in lines if ln.startswith("检出时间：")), ""
+    )
+    items = []
+    in_alerts = False
+    for ln in lines:
+        if ln == "## 告警":
+            in_alerts = True
+            continue
+        if in_alerts:
+            if ln.startswith("## "):
+                break
+            if ln.startswith("- "):
+                items.append(ln[2:].strip())
+    if not items:  # error 类文件：取检出时间后的首段描述
+        started = False
+        for ln in lines:
+            if ln.startswith("检出时间："):
+                started = True
+                continue
+            if started and ln.strip() and not ln.startswith("#"):
+                items.append(ln.strip())
+                break
+    return {"file": f.name, "title": title, "detected": detected, "items": items}
+
+
+def _render_alert_banner(alert: dict) -> str:
+    """告警横幅 HTML（深色主题 inline 样式 + form POST 确认）。
+
+    CSP（index.html script-src 'self'）禁 inline JS——确认按钮用原生 form POST
+    /api/ops/alerts/ack（303 回首页），无需任何脚本；style-src 允许 inline style。
+    """
+    items = "".join(f"<li>{escape(i)}</li>" for i in alert["items"]) or (
+        f"<li>{escape(alert['title'])}</li>"
+    )
+    return (
+        f'<div id="alert-banner" role="alert" aria-label="健康告警" style="'
+        f"background:#121722;border:1px solid #ff6b6b;border-radius:8px;"
+        f"color:#e8ecf4;margin:10px 14px 0;padding:10px 14px;font-size:13px;"
+        f'display:flex;gap:12px;align-items:flex-start">'
+        f'<div style="flex:1;min-width:0">'
+        f'<div style="color:#ff6b6b;font-weight:600;margin-bottom:4px">'
+        f"⚠ {escape(alert['title'])}"
+        f'<span style="color:#96a0b5;font-weight:400;margin-left:8px">'
+        f"{escape(alert['detected'])}</span></div>"
+        f'<ul style="margin:0;padding-left:18px">{items}</ul></div>'
+        f'<form method="post" action="/api/ops/alerts/ack" style="margin:0">'
+        f'<button type="submit" title="确认已处理" style="background:#ff6b6b;color:#0a0d14;'
+        f'border:0;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">'
+        f"确认</button></form></div>"
+    )
 
 
 def create_app(mode: str = "internal") -> FastAPI:
@@ -54,7 +133,19 @@ def create_app(mode: str = "internal") -> FastAPI:
 
     @app.get("/")
     def index():
-        return FileResponse(STATIC_DIR / "index.html")
+        html_path = STATIC_DIR / "index.html"
+        # 告警横幅只注入 internal 模式（public 战绩榜不暴露内部运维信息）
+        if app.state.mode != "internal":
+            return FileResponse(html_path)
+        try:
+            html = html_path.read_text(encoding="utf-8")
+        except OSError:
+            return FileResponse(html_path)
+        alert = _latest_unack_alert(_alerts_dir(app.state.db_path))
+        if alert is None:
+            return HTMLResponse(html)
+        html = html.replace(_BANNER_MARKER, _render_alert_banner(alert) + _BANNER_MARKER, 1)
+        return HTMLResponse(html)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app
@@ -144,6 +235,24 @@ def _register_internal(app: FastAPI, db_dep) -> None:
         except OSError:
             return JSONResponse(status_code=404, content={"detail": "log file not found"})
         return {"name": name, "lines": text.splitlines()[-100:]}
+
+    @app.get("/api/ops/alerts")
+    def ops_alerts():
+        """最新未确认告警（评审 §3.5）：首页横幅数据源，无告警时 latest=null。"""
+        return {"latest": _latest_unack_alert(_alerts_dir(app.state.db_path))}
+
+    @app.post("/api/ops/alerts/ack")
+    def ops_alerts_ack():
+        """确认告警：最新未确认告警文件改名 .ack.md（退出横幅），303 回首页。"""
+        info = _latest_unack_alert(_alerts_dir(app.state.db_path))
+        if info is not None:
+            f = _alerts_dir(app.state.db_path) / info["file"]
+            acked = f.with_name(f.name[: -len(".md")] + ".ack.md")
+            try:
+                f.replace(acked)
+            except OSError:
+                pass
+        return RedirectResponse("/", status_code=303)
 
 
 def _register_public(app: FastAPI, db_dep) -> None:

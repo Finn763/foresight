@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timedelta
 
+from predictor.calibration.calibrate import refresh_from_storage
 from predictor.resolution.registry import get_resolver
 
 
@@ -11,8 +12,12 @@ def auto_resolve(storage, now: datetime | None = None) -> dict:
 
     返回 {"resolved": n, "degraded": n, "pending": n}：
     - resolved: 判定成功并回填（含 evolution_log.resolution_ok，3-tuple extra 合并进 detail）
-    - degraded: resolver 无法判定 / resolution_spec JSON 损坏 → 记录 resolution_failed
+    - degraded: resolver 无法判定 / resolver 内部抛异常 / resolution_spec JSON 损坏 →
+      记录 resolution_failed（异常路径含异常类型与消息）
     - pending:  无 spec 或 class C（人工）或 B 类 client 构造失败（get_resolver → None）
+
+    本轮 resolved > 0 时尾部刷新校准器（data/calibrator.json）：16:30 自动揭晓是每日
+    最大宗揭晓路径，人工路径（scripts/resolve.py）已有此步；刷新失败只降级记日志。
     """
     now = now or datetime.now()
     stats = {"resolved": 0, "degraded": 0, "pending": 0}
@@ -51,10 +56,14 @@ def auto_resolve(storage, now: datetime | None = None) -> dict:
         if resolver is None:
             stats["pending"] += 1  # C 类人工 / B 类 client 构造失败
             continue
+        resolve_error: str | None = None
         try:
             outcome = resolver.resolve(q, q_spec, now)
-        except Exception:
+        except Exception as e:
+            # resolver 内部异常 ≠ 业务性 None：记录异常类型/消息（CC §2.7③），
+            # 与其它路径 resolution_failed 日志口径一致；整轮继续不 crash
             outcome = None
+            resolve_error = f"{type(e).__name__}: {e}"
         if outcome is not None:
             outcome_bool, source = outcome[0], outcome[1]
             extra = outcome[2] if len(outcome) > 2 else {}
@@ -78,25 +87,46 @@ def auto_resolve(storage, now: datetime | None = None) -> dict:
             )
         else:
             stats["degraded"] += 1
-            # 区分三类失败（运维排障用）：T+1/数据窗口等待、数据窗口已过（停止重试，
-            # 降级交 resolve_round 宽限超时分支）、真失败（数据不足/取价异常/双源分歧）。
-            # 与 market_resolver 窗口纪律同构。
-            detail = "resolver None（数据不足/取价失败/双源分歧）"
-            try:
-                tz = q_spec.get("close_timezone")
-                lo = (
-                    q.closes_at + timedelta(days=1) if tz and tz != "Asia/Shanghai" else q.closes_at
-                )
-                if now < lo:
-                    detail = "waiting data window（未到可判定时点）"
-                elif now >= lo + timedelta(days=1):
-                    detail = (
-                        "data window passed（数据窗口已过，停止重试；"
-                        "超宽限后由 resolve_round 降级人工）"
+            if resolve_error is not None:
+                # resolver 抛异常（非业务性 None）：直接记异常，不做数据窗口分类
+                detail = resolve_error
+            else:
+                # 区分三类失败（运维排障用）：T+1/数据窗口等待、数据窗口已过（停止重试，
+                # 降级交 resolve_round 宽限超时分支）、真失败（数据不足/取价异常/双源分歧）。
+                # 与 market_resolver 窗口纪律同构。
+                detail = "resolver None（数据不足/取价失败/双源分歧）"
+                try:
+                    tz = q_spec.get("close_timezone")
+                    lo = (
+                        q.closes_at + timedelta(days=1)
+                        if tz and tz != "Asia/Shanghai"
+                        else q.closes_at
                     )
-            except Exception:
-                pass
+                    if now < lo:
+                        detail = "waiting data window（未到可判定时点）"
+                    elif now >= lo + timedelta(days=1):
+                        detail = (
+                            "data window passed（数据窗口已过，停止重试；"
+                            "超宽限后由 resolve_round 降级人工）"
+                        )
+                except Exception:
+                    pass
             storage.log_evolution(
                 "resolution_failed", json.dumps({"qid": q.id, "detail": detail}, ensure_ascii=False)
+            )
+    if stats["resolved"] > 0:
+        # 校准闭环（CC §2.4）：16:30 自动揭晓是每日最大宗揭晓路径，回填后必须
+        # 重新 fit 并落盘 data/calibrator.json（人工路径 scripts/resolve.py 已有此步，
+        # 自动路径此前缺失——跨过 30 样本后生产 websearch 概率将用陈旧校准器）。
+        # 刷新失败只降级记日志，不阻塞本轮结果（样本不足时静默返回 False，不写盘）。
+        try:
+            refresh_from_storage(storage)
+        except Exception as e:
+            storage.log_evolution(
+                "calibrator_refresh_failed",
+                json.dumps(
+                    {"detail": f"calibrator refresh failed: {type(e).__name__}: {e}"},
+                    ensure_ascii=False,
+                ),
             )
     return stats

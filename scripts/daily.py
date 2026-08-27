@@ -12,7 +12,7 @@ import csv
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -68,6 +68,21 @@ def _log_event(st, event_type: str, detail: str) -> None:
         st.log_evolution(event_type, detail)
     except Exception:
         pass
+
+
+# 7 天更新纪律（CC §4.3，2026-08-27）：距上次预测满 7×24 小时才允许更新。
+# 用显式小时阈值把纪律锚定在纯流逝时长上——与时区/DST 无关；不用 `.days`
+# 截断写法（虽然对非负 timedelta 与 total_seconds 阈值等价，但显式 7×24h
+# 常量防未来被改成 date 相减的日历日差回归）。daily/evolve 双轨共用。
+_UPDATE_WINDOW = timedelta(hours=7 * 24)
+
+
+def _within_update_window(now: datetime, last: datetime) -> bool:
+    """距上次预测未满 7×24 小时 → True（跳过更新）。
+
+    now/last 须同域（同为 naive 或同为 aware）；aware 时按真实流逝时长计，
+    跨 DST 边界也以秒差为准（不随墙钟日历日漂移）。"""
+    return (now - last) < _UPDATE_WINDOW
 
 
 def _ensure_question_families(st: Storage, now: datetime) -> list[int]:
@@ -135,15 +150,15 @@ def _run(args, settings: Settings) -> None:
     sources = _build_sources()
     now = datetime.now()
 
-    # ① 未到期题 → 无预测则首次预测；距上次预测 ≥7 天则更新预测（持续更新纪律：
-    # 新证据→新概率；resolve 只认最后一条，旧行作废）
+    # ① 未到期题 → 无预测则首次预测；距上次预测满 7×24 小时则更新预测（持续更新
+    # 纪律：新证据→新概率；resolve 只认最后一条，旧行作废）
     predicted, skipped = 0, 0
     for q in st.list_unresolved():
         if q.closes_at <= now:
             continue  # 到期题走②
         last = st.last_prediction_at(q.id)
-        if last is not None and (now - last).days < 7:
-            continue  # 7 天内已预测：短周期题不重复打扰，长周期题每周更新
+        if last is not None and _within_update_window(now, last):
+            continue  # 未满 7×24h：短周期题不重复打扰，长周期题每周更新
         if _predict_safely(q.id, st, client, sources, now) is not None:
             predicted += 1
         else:

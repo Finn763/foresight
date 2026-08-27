@@ -38,6 +38,9 @@ def _data_dir(st) -> Path:
 
 # 难度三档 base_rates 的中文子串 key（difficulty_tier 约定，见 families.py docstring）
 _BASE_RATE_KEYS = ["标普", "上证", "布伦特", "黄金", "人民币"]
+# key 用作 difficulty_tier 匹配子串，本身不是题面——bare key 无窗口措辞，
+# compute_baseline 按 CC §2.2 宁缺毋滥返回 None。用带明确窗口的规范题面计算基线。
+_CANONICAL_TITLES = {"标普": "未来7天内标普500会创新高吗"}
 
 
 def _build_base_rates(now: datetime | None = None) -> dict:
@@ -58,7 +61,7 @@ def _build_base_rates(now: datetime | None = None) -> dict:
     rates = {}
     for key in _BASE_RATE_KEYS:
         try:
-            b = compute_baseline(key, sm)
+            b = compute_baseline(_CANONICAL_TITLES.get(key, key), sm, now=now)
         except Exception:
             b = None
         if b is not None and b.get("base_rate") is not None:

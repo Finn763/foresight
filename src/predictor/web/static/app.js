@@ -71,7 +71,7 @@ async function renderBoard() {
       <select id="f-arm" aria-label="按臂筛选">
         <option value="">全部臂</option>
         <option value="baseline">臂 A</option><option value="experiment">臂 B</option></select>
-      <input id="f-q" type="search" placeholder="关键词搜索…" value="${f.q}" aria-label="关键词搜索">
+      <input id="f-q" type="search" placeholder="关键词搜索…" value="${escAttr(f.q)}" aria-label="关键词搜索">
       <span class="count">${items.length} 题</span>
     </div>
     <div class="card table-card"><table>
@@ -83,7 +83,7 @@ async function renderBoard() {
           <td class="nowrap mono">${fmt(q.closes_at)}</td>
           <td>${badgeStatus(q.status)}</td>
           <td class="mono">${q.brier_score == null ? "—" : q.brier_score.toFixed(4)}</td>
-          <td><span class="badge cls">${q.resolution_class ?? "—"}</span></td>
+          <td><span class="badge cls">${q.resolution_class ? esc(q.resolution_class) : "—"}</span></td>
         </tr>`).join("") || `<tr><td colspan="7" class="empty">没有匹配的题目</td></tr>`}
       </tbody></table></div>`;
   $("#q-body").addEventListener("click", (e) => {
@@ -99,6 +99,14 @@ async function renderBoard() {
 
 function esc(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
 function escAttr(s) { return esc(s).replace(/"/g, "&quot;"); }
+// href 协议白名单：仅 http/https 与相对路径；javascript:/data: 等一律回落 "#"。
+function safeHref(url) {
+  if (!url) return "#";
+  let p;
+  try { p = new URL(url, location.origin); } catch { return "#"; }
+  if (p.protocol !== "http:" && p.protocol !== "https:") return "#";
+  return escAttr(url);
+}
 
 // ---- 详情弹层 ----
 async function openDetail(id) {
@@ -108,16 +116,16 @@ async function openDetail(id) {
     <div class="detail-hero"><div class="hero-label">预测概率</div>${probCell(d.probability)}</div>
     <dl class="kv">
       <dt>揭晓窗口</dt><dd class="mono">${fmt(d.opens_at)} → ${fmt(d.closes_at)}</dd>
-      <dt>状态</dt><dd>${badgeStatus(d.status)} ${d.resolution_class ? `<span class="badge cls">${d.resolution_class}</span>` : ""}</dd>
+      <dt>状态</dt><dd>${badgeStatus(d.status)} ${d.resolution_class ? `<span class="badge cls">${esc(d.resolution_class)}</span>` : ""}</dd>
       <dt>结果</dt><dd>${d.outcome == null ? "待揭晓" : (d.outcome ? "是 ✓" : "否 ✗")}</dd>
       <dt>Brier</dt><dd class="mono">${d.brier_score == null ? "—" : d.brier_score.toFixed(4)}</dd>
       <dt>臂</dt><dd class="mono">${d.arm ?? "—"}</dd>
-      <dt>判定规格</dt><dd class="spec">${d.resolution_spec ? JSON.stringify(d.resolution_spec) : "—"}</dd>
+      <dt>判定规格</dt><dd class="spec">${d.resolution_spec ? esc(JSON.stringify(d.resolution_spec)) : "—"}</dd>
     </dl>
     ${modelDivergence(d)}
     <div class="evidence"><h3>证据（${(d.documents || []).length}）</h3>
       <ul>${(d.documents || []).map((doc) => `
-        <li><a href="${esc(doc.url || "#")}" target="_blank" rel="noopener">${esc(doc.title || doc.url || "(无标题)")}</a>
+        <li><a href="${safeHref(doc.url)}" target="_blank" rel="noopener">${esc(doc.title || doc.url || "(无标题)")}</a>
             <span class="src">${esc(doc.source)} · ${fmt(doc.published_at)}</span></li>`).join("") ||
         `<li class="muted">无证据文档</li>`}
       </ul></div>`;

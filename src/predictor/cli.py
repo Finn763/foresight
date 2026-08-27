@@ -108,7 +108,7 @@ def predict_once(
 
                 sm = fetch_series_map(now=now)
                 historical_context = build_series_context(sm, now=now)
-                baseline = compute_baseline(title, sm)
+                baseline = compute_baseline(title, sm, now=now, closes_at=closes)
             except Exception:
                 pass
             from predictor.websearch_predictor import websearch_predict

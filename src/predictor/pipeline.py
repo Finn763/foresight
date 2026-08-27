@@ -62,7 +62,7 @@ def run_prediction(
 
         sm = fetch_series_map(now=now)
         historical_context = build_series_context(sm, now=now)
-        baseline = compute_baseline(q.title, sm)
+        baseline = compute_baseline(q.title, sm, now=now, closes_at=q.closes_at)
     except Exception:
         pass
     try:

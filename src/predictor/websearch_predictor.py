@@ -246,14 +246,17 @@ def websearch_predict(
     )
 
 
-def _load_baseline(title: str, now: datetime):
+def _load_baseline(title: str, now: datetime, closes_at: datetime):
     """方案 A 历史数据层：失败降级 (None, "")，不阻塞预测。"""
     try:
         from predictor.stats.baselines import compute_baseline
         from predictor.stats.historical import build_series_context, fetch_series_map
 
         sm = fetch_series_map(now=now)
-        return compute_baseline(title, sm), build_series_context(sm, now=now)
+        return (
+            compute_baseline(title, sm, now=now, closes_at=closes_at),
+            build_series_context(sm, now=now),
+        )
     except Exception:
         return None, ""
 
@@ -267,7 +270,7 @@ def predict_with_websearch(
         q = storage.get_question(question_id)
     except KeyError:
         return None
-    baseline, historical_context = _load_baseline(q.title, now)
+    baseline, historical_context = _load_baseline(q.title, now, q.closes_at)
     return websearch_predict(
         question_id,
         q.title,

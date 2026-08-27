@@ -308,3 +308,48 @@ def test_main_logs_round_events_per_subround(tmp_path, monkeypatch):
     pairs = [(r[0], json.loads(r[1]).get("round")) for r in rows]
     assert pairs[0] == ("round_started", "evolve_resolve")
     assert pairs[-1] == ("round_completed", "evolve_resolve")
+
+
+def test_build_base_rates_canonical_titles(monkeypatch):
+    """CC §2.2 修复接线：bare key（"标普"）无窗口措辞 → compute_baseline 宁缺毋滥
+    返回 None；evolve 用规范题面（未来7天内标普500会创新高吗）计算族基线。"""
+    import random
+
+    import scripts.evolve as ev
+    from predictor.stats import historical
+
+    rng = random.Random(42)
+    price, d = 2000.0, datetime(2020, 1, 1)
+    rows = []
+    while len(rows) < 600:
+        if d.weekday() < 5:
+            price *= 1 + 0.0003 + rng.gauss(0, 0.006)
+            rows.append(
+                {
+                    "date": d.strftime("%Y-%m-%d"),
+                    "open": price,
+                    "close": price,
+                    "high": price * 1.01,
+                    "low": price * 0.99,
+                }
+            )
+        d += timedelta(days=1)
+    monkeypatch.setattr(
+        historical,
+        "fetch_series_map",
+        lambda now=None: {
+            "sp500": rows,
+            "usdcnh": [],
+            "gold": [],
+            "brent": [],
+            "shanghai": [],
+            "dow": [],
+            "cpi_cn": [],
+            "ffr": [],
+            "wti_price": [],
+            "wti_stock": [],
+        },
+    )
+    rates = ev._build_base_rates(now=datetime(2026, 8, 27, 9, 0))
+    assert "标普" in rates
+    assert 0.0 < rates["标普"] < 1.0

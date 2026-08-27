@@ -6,20 +6,32 @@
 
 from __future__ import annotations
 
+import calendar
 import re
+from datetime import date, datetime
 from typing import Any
 
 # 题目类型识别（标题关键词 → 基线算法）
 # 顺序即优先级：更具体的 pattern 在前（cny_below 带"升破+阈值"比 usdcnh_7 的"人民币兑美元"更具体，
-# 否则"离岸人民币兑美元会升破6.90"会先命中 usdcnh_7 的 7.0 阈值）
+# 否则"离岸人民币兑美元会升破6.90"会先命中 usdcnh_7 的 7.0 阈值）。
+# CC §2.2 修复（2026-08-27）：
+#  - sp500_break：标普"站上/突破 N 点"阈值题走 breakout 算法（原误走创新高算法）；
+#  - sp500_high 必须带标普主体：裸"创新高"（如"淘宝成交额创历史新高"）不再映射标普；
+#  - cpi_mom 两支都要求「中国」：排除"美国 CPI 同比"误注入中国序列（CHNCPIALLMINMEI）；
+#  - ffr_meeting 只认美联储语境（防"某国央行降息/维持利率"误注入 DFF），方向三支
+#    （加息/降息/维持）在 baseline_ffr_meeting 内按题面判定。
 _PATTERNS = [
-    (re.compile(r"标普|S&P|创新高"), "sp500_high"),
+    (
+        re.compile(r"(?:标普|S&P|SPX|标准普尔).*(?:站上|突破|升破|触及)\s*(\d+(?:\.\d+)?)"),
+        "sp500_break",
+    ),
+    (re.compile(r"(?:标普|S&P|SPX|标准普尔).*(?:创新高|新高)"), "sp500_high"),
     # (?<!美元兑)：排除"美元兑人民币升破7.0"反向句式（该句式汇率数值上涨，方向与
     # cny_below 的 low≤阈值相反，留给既有 usdcnh_7 粗分类）
     (re.compile(r"(?<!美元兑)人民币(?:兑美元)?.*升破\s*(\d+(?:\.\d+)?)"), "cny_below"),
     (re.compile(r"人民币兑美元|汇率|破 ?7\.0"), "usdcnh_7"),
-    (re.compile(r"中国.*CPI|CPI.*同比"), "cpi_mom"),
-    (re.compile(r"美联储|FOMC|维持利率|降息"), "ffr_meeting"),
+    (re.compile(r"中国.*CPI|CPI.*同比.*中国"), "cpi_mom"),
+    (re.compile(r"美联储|FOMC"), "ffr_meeting"),
     (re.compile(r"EIA|原油库存"), "wti_stock"),
     (re.compile(r"黄金.*突破\s*(\d+)"), "gold_break"),
     (re.compile(r"布伦特.*突破\s*(\d+)"), "brent_break"),
@@ -27,11 +39,108 @@ _PATTERNS = [
     (re.compile(r"(道琼斯|道指).*(收涨|上涨)"), "dow_up"),
 ]
 
+# CC §2.2 宁缺毋滥：窗口 >90 天的题不注入基线（低频历史频率外推失真，且与
+# 月/年底口径题的真正剩余窗口偏差太大——"年底前升破 7.0"≈126 天、"标普首次
+# 站上 8500"≈157 天，注入 7/30 天窗口频率是系统性错锚点）。
+_MAX_WINDOW_DAYS = 90
+
 
 def _classify(title: str) -> str | None:
     for pat, kind in _PATTERNS:
         if pat.search(title):
             return kind
+    return None
+
+
+def _end_of_month(d: date) -> date:
+    return d.replace(day=calendar.monthrange(d.year, d.month)[1])
+
+
+def _parse_title_window(title: str, now: datetime) -> int | None:
+    """题面窗口措辞 → 天数。支持绝对日期/月底/年底/月-日/数量单位（天周月年）。
+
+    无法从题面识别窗口返回 None（调用方走 closes_at 兜底或宁缺毋滥降级）。
+    """
+    today = now.date()
+    # 1) 绝对日期：2027年1月31日前 / 2027年1月31日
+    m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", title)
+    if m:
+        try:
+            return (date(int(m.group(1)), int(m.group(2)), int(m.group(3))) - today).days
+        except ValueError:
+            return None
+    # 2) 带年份的月底：2026年10月底前
+    m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(?:底|末)", title)
+    if m:
+        try:
+            return (_end_of_month(date(int(m.group(1)), int(m.group(2)), 1)) - today).days
+        except ValueError:
+            return None
+    # 3) 带年份的年底/年末/年内：2026年底前
+    m = re.search(r"(\d{4})\s*年\s*(?:底|末|内)", title)
+    if m:
+        return (date(int(m.group(1)), 12, 31) - today).days
+    # 4) 不带年份的月-日：9月30日前（已过则取明年同月日）
+    m = re.search(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*日", title)
+    if m:
+        mo, day = int(m.group(1)), int(m.group(2))
+        for year in (today.year, today.year + 1):
+            try:
+                target = date(year, mo, day)
+            except ValueError:
+                return None
+            if target >= today:
+                return (target - today).days
+        return None
+    # 5) 不带年份的月底：10月底前 / 月底前 / 本月底
+    m = re.search(r"(?<!\d)(\d{1,2})\s*月\s*(?:底|末)", title)
+    if m:
+        mo = int(m.group(1))
+        try:
+            target = _end_of_month(date(today.year, mo, 1))
+        except ValueError:
+            return None
+        if target < today:
+            target = _end_of_month(date(today.year + 1, mo, 1))
+        return (target - today).days
+    if re.search(r"(?:本?月底|月末)", title):
+        return (_end_of_month(today) - today).days
+    # 6) 数量单位：N天/日/周/星期/月/年。年计数 >5 视为日历年份措辞残留（如
+    # "2026 年 9 月"被误读为"26 年"），不按数量解析。
+    m = re.search(r"(\d{1,3})\s*个?\s*(天|日|周|星期|月|年)", title)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit == "年" and n > 5:
+            return None
+        return {
+            "天": n,
+            "日": n,
+            "周": n * 7,
+            "星期": n * 7,
+            "月": n * 30,
+            "年": n * 365,
+        }[unit]
+    # 7) 裸年底/年末/年内/今年（无年份、无计数，如"年底前"；须在数量单位之后，
+    # 否则"未来1年内"的"年内"会被误当年底口径）
+    if re.search(r"(?:今年|年底|年末|年内)", title):
+        return (date(today.year, 12, 31) - today).days
+    return None
+
+
+def _resolve_window(title: str, now: datetime, closes_at: datetime | None) -> int | None:
+    """解析题面窗口 → 天数；题面无措辞时回退 closes_at-now；>90 天或无法确定 → None。"""
+    days = _parse_title_window(title, now)
+    if days is not None:
+        return days if 1 <= days <= _MAX_WINDOW_DAYS else None
+    if closes_at is not None:
+        try:
+            d = (closes_at - now).days
+        except TypeError:  # tz 混用等异常输入 → 无法确定
+            return None
+        if d < 0:
+            return None
+        d = max(d, 1)
+        return d if d <= _MAX_WINDOW_DAYS else None
     return None
 
 
@@ -187,7 +296,11 @@ def baseline_cpi_mom(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def baseline_ffr_meeting(rows: list[dict[str, Any]], title: str) -> dict[str, Any] | None:
-    """美联储利率题基线：历史"相邻月末利率未变"频率（近似 FOMC 会议维持利率的先验）。
+    """美联储利率题基线：历史"相邻月末利率变化方向"频率（近似 FOMC 决议先验）。
+
+    CC §2.2 修复：方向三支按题面判定——加息/升息/上调 → 上调频率；降息/下调 →
+    下调频率；维持/不变/按兵不动 → 维持频率；方向不明 → None（宁缺毋滥，不再
+    一律注入"维持利率不变"，那会给"9 月会加息吗"类题方向性误导锚点）。
 
     DFF 为日频——先按月份聚合取**月末值**，再比较相邻月末（月末间变化 = 当月会议动了利率）。
     """
@@ -203,21 +316,27 @@ def baseline_ffr_meeting(rows: list[dict[str, Any]], title: str) -> dict[str, An
             cur_key = key
         else:
             month_end[-1] = r["close"]  # 同月覆盖为最新
-    hold = down = 0
+    hold = up = down = 0
     for i in range(1, len(month_end)):
         diff = month_end[i] - month_end[i - 1]
         # 阈值 5bp：DFF 有效利率日间波动 1-5bp 属常态；FOMC 调整通常 25bp
         if abs(diff) < 0.05:
             hold += 1
-        elif diff < -0.05:
+        elif diff > 0.05:
+            up += 1
+        else:
             down += 1
     total = len(month_end) - 1
     if total < 12:
         return None
-    if "降息" in title:
+    if re.search(r"加息|升息|上调", title):
+        rate, name = up / total, "利率上调"
+    elif re.search(r"降息|下调", title):
         rate, name = down / total, "利率下调"
-    else:
+    elif re.search(r"维持|不变|按兵不动", title):
         rate, name = hold / total, "利率维持不变"
+    else:
+        return None
     return {
         "kind": "ffr_meeting",
         "base_rate": rate,
@@ -249,19 +368,43 @@ def baseline_wti_stock(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def compute_baseline(
-    title: str, series_map: dict[str, list[dict[str, Any]]]
+    title: str,
+    series_map: dict[str, list[dict[str, Any]]],
+    *,
+    now: datetime | None = None,
+    closes_at: datetime | None = None,
 ) -> dict[str, Any] | None:
-    """按题类型算基线；无匹配类型或数据不足返回 None（调用方降级，不阻塞预测）。"""
+    """按题类型算基线；无匹配类型或数据不足返回 None（调用方降级，不阻塞预测）。
+
+    now/closes_at 用于窗口解析（CC §2.2 修复后窗口不再是硬编码默认值）：题面有
+    明确窗口措辞（天/周/月/年/月底/年底/绝对日期）用之；否则回退 closes_at-now；
+    两者都无法确定或窗口 >90 天 → None（宁缺毋滥，不注入错误频率的锚点）。
+    """
     kind = _classify(title)
     if kind is None:
         return None
+    now = now or datetime.now()
     if kind == "sp500_high":
-        m = re.search(r"(\d+)\s*天", title)
-        window = int(m.group(1)) if m else 7
+        window = _resolve_window(title, now, closes_at)
+        if window is None:
+            return None
         return baseline_sp500_high(series_map.get("sp500", []), window)
+    if kind == "sp500_break":
+        m = re.search(r"(?:标普|S&P|SPX|标准普尔).*(?:站上|突破|升破|触及)\s*(\d+(?:\.\d+)?)", title)
+        threshold = float(m.group(1)) if m else None
+        if threshold is None:
+            return None
+        window = _resolve_window(title, now, closes_at)
+        if window is None:
+            return None
+        result = baseline_breakout(series_map.get("sp500", []), threshold, window)
+        if result is not None:
+            result["kind"] = kind
+        return result
     if kind == "usdcnh_7":
-        m = re.search(r"(\d+)\s*天", title)
-        window = int(m.group(1)) if m else 30
+        window = _resolve_window(title, now, closes_at)
+        if window is None:
+            return None
         return baseline_usdcnh_7(series_map.get("usdcnh", []), window)
     if kind == "cpi_mom":
         return baseline_cpi_mom(series_map.get("cpi_cn", []))
@@ -274,8 +417,9 @@ def compute_baseline(
         threshold = float(m.group(1)) if m else None
         if threshold is None:
             return None
-        wm = re.search(r"(\d+)\s*天", title)
-        window = int(wm.group(1)) if wm else 7
+        window = _resolve_window(title, now, closes_at)
+        if window is None:
+            return None
         result = baseline_breakout(series_map.get("gold", []), threshold, window)
         if result is not None:
             result["kind"] = kind
@@ -285,8 +429,9 @@ def compute_baseline(
         threshold = float(m.group(1)) if m else None
         if threshold is None:
             return None
-        wm = re.search(r"(\d+)\s*天", title)
-        window = int(wm.group(1)) if wm else 30
+        window = _resolve_window(title, now, closes_at)
+        if window is None:
+            return None
         result = baseline_breakout(series_map.get("brent", []), threshold, window)
         if result is not None:
             result["kind"] = kind
@@ -306,8 +451,9 @@ def compute_baseline(
         threshold = float(m.group(1)) if m else None
         if threshold is None:
             return None
-        wm = re.search(r"(\d+)\s*天", title)
-        window = int(wm.group(1)) if wm else 30
+        window = _resolve_window(title, now, closes_at)
+        if window is None:
+            return None
         result = baseline_cny_below(series_map.get("usdcnh", []), threshold, window)
         if result is not None:
             result["kind"] = kind

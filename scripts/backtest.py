@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from predictor.config import Settings
 from predictor.data.benchmarks import fetch_forecastbench_questions
-from predictor.eval.backtest import run_zero_shot_backtest
+from predictor.eval.backtest import json_safe, run_zero_shot_backtest
 from predictor.llm.client import LLMClient
 
 
@@ -25,15 +25,18 @@ def main() -> None:
     rep = run_zero_shot_backtest(client, questions, sample_size=args.sample)
     report = {
         "n": rep.n,
+        "skipped_outcome_missing": rep.skipped_outcome_missing,
         "brier_mean": rep.brier_mean,
         "brier_sd": rep.brier_sd,
         "ci95_low": rep.ci95_low,
         "ci95_high": rep.ci95_high,
         "baseline_name": rep.baseline_name,
     }
+    # json_safe 把 NaN（无样本臂）转 null；allow_nan=False 兜底不写非法 JSON 字面量
+    payload = json.dumps(json_safe(report), indent=2, ensure_ascii=False, allow_nan=False)
     Path("data").mkdir(exist_ok=True)
-    Path("data/backtest_baseline.json").write_text(json.dumps(report, indent=2, ensure_ascii=False))
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+    Path("data/backtest_baseline.json").write_text(payload, encoding="utf-8")
+    print(payload)
 
 
 if __name__ == "__main__":

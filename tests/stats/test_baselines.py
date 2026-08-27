@@ -241,3 +241,157 @@ def test_compute_baseline_new_kinds():
     assert compute_baseline("未来7天内COMEX黄金会突破5150美元吗", {}) is None
     assert compute_baseline("上证指数明天会收涨吗", {"shanghai": []}) is None
     assert compute_baseline("未来30天内人民币会升破6.95吗", {}) is None
+
+
+# ---------- CC §2.2 修复回归测试（2026-08-27） ----------
+
+NOW = datetime(2026, 8, 27, 9, 0)
+
+
+def _monthly_rows(closes: list[float]) -> list[dict]:
+    """确定性月频序列：2020-01 起逐月一个观测（date/close/open/high/low）。"""
+    rows = []
+    y, m = 2020, 1
+    for v in closes:
+        rows.append(
+            {
+                "date": f"{y:04d}-{m:02d}-28",
+                "open": v,
+                "close": v,
+                "high": v,
+                "low": v,
+            }
+        )
+        m += 1
+        if m > 12:
+            y, m = y + 1, 1
+    return rows
+
+
+def test_cpi_requires_china():
+    """CC §2.2 #1：「美国 CPI 同比」不得注入中国 CPI 序列；「中国 CPI」照常。"""
+    closes = [100.0 + (i % 2) for i in range(36)]  # 100/101 交替 → 18/35 上升
+    sm = {"cpi_cn": _monthly_rows(closes)}
+    b = compute_baseline("中国08月 CPI 同比会高于上月吗", sm)
+    assert b is not None and b["kind"] == "cpi_mom"
+    assert b["base_rate"] == pytest.approx(18 / 35)
+    # 美国 CPI 题（#54）→ None（原 bug：命中 cpi_mom 注入中国序列 0.486）
+    assert compute_baseline("2026 年 9 月美国 CPI 同比会高于 8 月吗", sm) is None
+    assert compute_baseline("美国 CPI 同比会超预期吗", sm) is None
+
+
+def test_parse_title_window_units():
+    from predictor.stats.baselines import _parse_title_window
+
+    assert _parse_title_window("未来 7 天内标普 500 会创新高吗", NOW) == 7
+    assert _parse_title_window("未来1个月内人民币会升破6.95吗", NOW) == 30
+    assert _parse_title_window("未来2周内布伦特会突破90美元吗", NOW) == 14
+    assert _parse_title_window("未来3个月内人民币会升破6.95吗", NOW) == 90
+    assert _parse_title_window("未来1年内人民币会升破6.95吗", NOW) == 365
+
+
+def test_parse_title_window_calendar():
+    from predictor.stats.baselines import _parse_title_window
+
+    # 年底：#6 口径 2026-12-31 - 2026-08-27 = 126 天
+    assert _parse_title_window("2026 年底前人民币兑美元会升破 7.0 吗", NOW) == 126
+    # 绝对日期：#64 口径 2027-01-31 - 2026-08-27 = 157 天
+    assert _parse_title_window("2027 年 1 月 31 日前 标普 500 会首次站上 8500 点吗", NOW) == 157
+    # 带年份的月底：#56 口径 2026-10-31 - 2026-08-27 = 65 天
+    assert _parse_title_window("2026 年 10 月底前 布伦特原油价格会突破 95 美元/桶吗", NOW) == 65
+    # 不带年份的月-日（未过 → 今年；已过 → 明年）
+    assert _parse_title_window("9 月 30 日前会完成吗", NOW) == 34
+    assert _parse_title_window("8 月 31 日前会完成吗", NOW) == 4
+    assert _parse_title_window("7 月 1 日前会完成吗", NOW) == 308
+    # 不带年份的月底 / 本月底
+    assert _parse_title_window("10 月底前会完成吗", NOW) == 65
+    assert _parse_title_window("月底前会完成吗", NOW) == 4
+    # 无窗口措辞 → None
+    assert _parse_title_window("美元兑人民币会升破7.0吗", NOW) is None
+
+
+def test_window_over_90_days_returns_none():
+    """CC §2.2 #2：月/年底/绝对日期口径 >90 天 → None（宁缺毋滥，不注入错频率）。"""
+    rows = _gen_series(600)
+    sm = {"sp500": rows, "usdcnh": rows}
+    # #6：年底前升破 7.0（126 天）→ None（原 bug：注入 30 天窗口频率）
+    b = compute_baseline(
+        "2026 年底前人民币兑美元会升破 7.0 吗",
+        sm,
+        now=NOW,
+        closes_at=datetime(2026, 12, 31, 9, 0),
+    )
+    assert b is None
+    # #64：绝对日期 157 天 → None（原 bug：注入 7 天创新高频率）
+    b = compute_baseline(
+        "2027 年 1 月 31 日前 标普 500 会首次站上 8500 点吗",
+        sm,
+        now=NOW,
+        closes_at=datetime(2027, 1, 29, 9, 0),
+    )
+    assert b is None
+    # 题面无窗口措辞 → closes_at-now 兜底（30 天）
+    b = compute_baseline(
+        "美元兑人民币会升破7.0吗", sm, now=NOW, closes_at=NOW + timedelta(days=30)
+    )
+    assert b is not None and b["kind"] == "usdcnh_7" and b["window_days"] == 30
+    # closes_at 兜底同样受 90 天上限约束
+    b = compute_baseline(
+        "美元兑人民币会升破7.0吗", sm, now=NOW, closes_at=NOW + timedelta(days=120)
+    )
+    assert b is None
+    # 无窗口措辞且无 closes_at → None
+    assert compute_baseline("美元兑人民币会升破7.0吗", sm, now=NOW) is None
+    # 明确 30 天窗口不受 closes_at 影响（题面优先）
+    b = compute_baseline(
+        "未来30天内人民币兑美元会升破7.0吗",
+        sm,
+        now=NOW,
+        closes_at=NOW + timedelta(days=60),
+    )
+    assert b is not None and b["kind"] == "cny_below" and b["window_days"] == 30
+
+
+def test_ffr_three_way_direction():
+    """CC §2.2 #3：加息/降息/维持三向分支；方向不明 → None；非美联储语境不注入 DFF。"""
+    diffs = [0.0] * 20 + [0.25] * 6 + [-0.25] * 10  # hold=20 up=6 down=10, total=36
+    vals = [2.0]
+    for d in diffs:
+        vals.append(vals[-1] + d)
+    sm = {"ffr": _monthly_rows(vals)}
+    # #72/#73/#74 类：加息 → 历史上调频率（原 bug：一律注入"维持" 0.764）
+    b_up = compute_baseline("美联储9月会加息吗", sm)
+    assert b_up is not None and b_up["kind"] == "ffr_meeting"
+    assert b_up["base_rate"] == pytest.approx(6 / 36)
+    assert "上调" in b_up["method"]
+    b_down = compute_baseline("2026年9月FOMC会议会降息吗", sm)
+    assert b_down["base_rate"] == pytest.approx(10 / 36)
+    assert "下调" in b_down["method"]
+    b_hold = compute_baseline("2026 年 9 月 FOMC 会议会维持利率不变吗", sm)
+    assert b_hold["base_rate"] == pytest.approx(20 / 36)
+    assert "维持" in b_hold["method"]
+    # 方向不明（只提会议不提方向）→ None
+    assert compute_baseline("美联储9月会议会宣布什么", sm) is None
+    # 非美联储语境（某国央行降息）→ None（原 bug：`降息` 分支命中 ffr 注入 DFF）
+    assert compute_baseline("中国人民银行会降息吗", sm) is None
+
+
+def test_sp500_threshold_uses_breakout():
+    """CC §2.2 #4：标普「站上/突破 N 点」走 breakout 算法，非创新高算法。"""
+    threshold = 6500.0
+    rows = _flat_rows(600, high_fn=lambda i: threshold + 1 if i >= 355 else threshold - 1)
+    sm = {"sp500": rows}
+    b = compute_baseline(
+        "未来30天内标普500会站上6500点吗", sm, now=NOW, closes_at=NOW + timedelta(days=30)
+    )
+    assert b is not None and b["kind"] == "sp500_break"
+    assert b["threshold"] == threshold
+    assert b["window_days"] == 30
+    # window_days=30 → n_trade=21；t ∈ [100, 579) 共 479 个窗口；t≥334（t+21≥355）的
+    # 245 个窗口命中 high 突破
+    assert b["base_rate"] == pytest.approx(245 / 479)
+    # 真正的"创新高"题仍走 sp500_high（不受影响）
+    b2 = compute_baseline("未来 7 天内标普 500 会创新高吗", {"sp500": _gen_series(600)}, now=NOW)
+    assert b2 is not None and b2["kind"] == "sp500_high" and b2["window_days"] == 7
+    # 裸"创新高"（非标普题，如淘宝成交额）不再映射到标普序列
+    assert compute_baseline("2026 年淘宝双 11 全网成交额会创历史新高吗", sm, now=NOW) is None

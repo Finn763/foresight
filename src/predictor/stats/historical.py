@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -204,23 +206,62 @@ def fetch_series(
         return []
 
 
+# ---- 轮级日粒度缓存 + 并发拉取（CC §4.1 修复，2026-08-27）----
+# 缓存 key 取日期粒度而非精确 now：daily/evolve 同轮内每题 now 仅秒级差异、
+# 结果完全相同，同一自然日只需真实拉取一次；跨日自动失效。
+_series_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+_series_cache_lock = threading.Lock()
+
+
+def cache_clear() -> None:
+    """清空 fetch_series_map 的轮级缓存（测试隔离 / 长时间驻留进程维护用）。"""
+    global _series_cache
+    with _series_cache_lock:
+        _series_cache = {}
+
+
+def _fetch_one(key: str, cfg: dict[str, Any], end_ts: int, end_str: str) -> list[dict[str, Any]]:
+    """拉单个序列。异常上抛，由 fetch_series_map 统一降级为空并标记本轮失败。"""
+    if cfg.get("fred"):
+        return fetch_fred_series(cfg["fred"], end=end_str)
+    if cfg.get("eia"):
+        return fetch_eia_series(end=end_str)
+    return fetch_series(cfg["symbol"], end_ts=end_ts)
+
+
 def fetch_series_map(now: datetime | None = None) -> dict[str, list[dict[str, Any]]]:
-    """拉全部序列，只保留 ≤ now 的数据（防泄漏）。失败序列留空。"""
+    """拉全部序列，只保留 ≤ now 的数据（防泄漏）。失败序列留空。
+
+    性能（CC §4.1 修复）：
+    - 10 序列用 ThreadPoolExecutor 并发拉取（原串行 ~20.4s → 与最慢单序列相当）；
+    - 缓存 key = now 的日期（非精确时刻）：同一天内后续调用零网络直接命中，
+      跨日自动失效；拉取失败（任一序列抛异常，或全部序列为空）不写缓存，
+      下次调用自动重试。cache_clear() 手动清缓存。
+    """
     now = now or datetime.now()
+    cache_key = now.date().isoformat()
+    with _series_cache_lock:
+        cached = _series_cache.get(cache_key)
+    if cached is not None:
+        return cached
     end_ts = _to_ts(now)
     end_str = now.strftime("%Y-%m-%d")
-    out = {}
-    for key, cfg in SERIES.items():
-        try:
-            if cfg.get("fred"):
-                rows = fetch_fred_series(cfg["fred"], end=end_str)
-            elif cfg.get("eia"):
-                rows = fetch_eia_series(end=end_str)
-            else:
-                rows = fetch_series(cfg["symbol"], end_ts=end_ts)
-            out[key] = rows
-        except Exception:
-            out[key] = []  # 任何异常 → 空序列（调用方降级，不阻塞预测）
+    out: dict[str, list[dict[str, Any]]] = {}
+    failed = 0
+    with ThreadPoolExecutor(max_workers=len(SERIES)) as ex:
+        futures = {
+            ex.submit(_fetch_one, key, cfg, end_ts, end_str): key for key, cfg in SERIES.items()
+        }
+        for fut in as_completed(futures):
+            key = futures[fut]
+            try:
+                out[key] = fut.result()
+            except Exception:
+                out[key] = []  # 单序列失败不拖垮整体（保留原降级语义）
+                failed += 1
+    if failed == 0 and any(out.values()):
+        with _series_cache_lock:
+            _series_cache.setdefault(cache_key, out)
     return out
 
 

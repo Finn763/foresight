@@ -1,5 +1,6 @@
 """Polymarket 数据源测试：拉取解析（MockTransport）+ 分档筛选 + 翻译降级。"""
 
+import sys
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -10,6 +11,7 @@ from predictor.data.polymarket_source import (
     select_candidates,
     translate_title,
 )
+from predictor.data.storage import Storage
 
 
 def _client(payload: list | dict) -> httpx.Client:
@@ -221,3 +223,68 @@ def test_should_fallback_window_boundary():
     assert should_fallback(closes + timedelta(days=3), closes) is True
     assert should_fallback(closes + timedelta(days=10), closes) is True
     assert should_fallback(closes - timedelta(days=1), closes) is False  # 未到期
+
+
+def _load_pm_resolve():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pm_resolve", "scripts/pm_resolve.py")
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_main_db_init_failure_returns_1(monkeypatch, capsys):
+    """DB 撞锁（Storage 构造抛异常）→ 优雅 exit 1 + 可读消息，不裸 traceback。"""
+    mod = _load_pm_resolve()
+
+    def boom(db_path, **kw):
+        raise RuntimeError("IO Error: database is locked")
+
+    monkeypatch.setattr(mod, "Storage", boom)
+    monkeypatch.setattr(sys, "argv", ["pm_resolve.py", "--db", "locked.db"])
+    assert mod.main() == 1
+    out = capsys.readouterr().out
+    assert "持锁" in out
+    assert "Traceback" not in out
+
+
+def test_main_llm_unavailable_does_not_block_market_and_rerun_idempotent(
+    tmp_path, monkeypatch, capsys
+):
+    """LLM 客户端构造失败不阻断后续题市场决议；重跑不重复揭晓（幂等）。"""
+    mod = _load_pm_resolve()
+    db = tmp_path / "pm.db"
+    st = Storage(str(db))
+    st.create_schema()
+    now = datetime.now()
+    spec_pm = lambda mid: {"source": "polymarket", "market_id": mid}  # noqa: E731
+    q1 = st.add_question("Q1", now - timedelta(days=1), resolution_spec=spec_pm("m1"))
+    q2 = st.add_question("Q2", now - timedelta(days=10), resolution_spec=spec_pm("m2"))
+    q3 = st.add_question("Q3", now - timedelta(days=1), resolution_spec=spec_pm("m3"))
+
+    # m2 市场未决议且超独占窗口 → 走 LLM 兜底；m1/m3 市场已决议
+    outcomes = {"m1": True, "m2": None, "m3": False}
+    monkeypatch.setattr(mod, "market_outcome", lambda http, mid: outcomes.get(mid))
+
+    def boom(**kw):
+        raise RuntimeError("no api key in test")
+
+    monkeypatch.setattr(mod, "LLMClient", boom)
+    monkeypatch.setattr(sys, "argv", ["pm_resolve.py", "--db", str(db)])
+
+    assert mod.main() == 0  # 首轮：m1/m3 市场决议，m2 兜底不可用跳过，整轮不崩
+    st2 = Storage(str(db))
+    assert st2.get_question(q1).outcome is True
+    assert st2.get_question(q3).outcome is False
+    assert st2.get_question(q2).outcome is None
+    out = capsys.readouterr().out
+    assert "LLM 兜底跳过" in out
+
+    assert mod.main() == 0  # 重跑：已揭晓跳过、未揭晓继续等待 → 幂等，无重复回填
+    assert st2.get_question(q1).outcome is True
+    assert st2.get_question(q2).outcome is None
+    assert st2.get_question(q3).outcome is False
+    out2 = capsys.readouterr().out
+    assert "本轮揭晓 0 题" in out2

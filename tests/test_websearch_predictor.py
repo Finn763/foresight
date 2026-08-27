@@ -1,7 +1,9 @@
 """websearch_predictor 单测（fake client 注入，零网络）：解析/护栏/ensemble/拒绝路径。"""
 
+import asyncio
 import json
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -9,16 +11,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from predictor.data.storage import Storage
 from predictor.llm.client import LLMError
-from predictor.websearch_predictor import _extract_citations, websearch_predict
+from predictor.websearch_predictor import _extract_citations, _sample, websearch_predict
 
 
 class FakeClient:
-    def __init__(self, responses):
+    def __init__(self, responses, delay: float = 0.0):
         self._responses = list(responses)
         self.calls = []
+        self.delay = delay
 
     def responses_create(self, **kw):
+        """同步路径（_sample 串行基准用）。"""
         self.calls.append(kw)
+        if not self._responses:
+            raise LLMError("no more responses")
+        return self._responses.pop(0)
+
+    async def aresponses_create(self, **kw):
+        """并发采样路径（websearch_predict 经 asyncio.gather 直接 await）。"""
+        self.calls.append(kw)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if not self._responses:
             raise LLMError("no more responses")
         return self._responses.pop(0)
@@ -232,3 +245,104 @@ def _msg_text(raw):
                 if block.get("type") == "output_text":
                     return block["text"]
     return "{}"
+
+
+# ---------------------------------------------------------------------------
+# CC §4.2：采样并发化（asyncio.gather）——顺序与结果等价 + 墙钟并发证明
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_sampling_matches_serial_semantics():
+    """并发采样与串行聚合语义等价：概率均值、引用合并、采样顺序不变（n_samples=3）。"""
+    st, qid = _st()
+    responses = [
+        _msg_response(0.30, "理由一", ["https://a/1"], ["https://o/1"]),
+        _msg_response(0.34, "理由二", ["https://a/1", "https://b/2"], ["https://o/2"]),
+        _msg_response(0.36, "理由三", ["https://c/3"], []),
+    ]
+    pred = websearch_predict(
+        qid,
+        "t",
+        datetime(2026, 9, 17, 9, 0),
+        datetime(2026, 8, 13, 20, 0),
+        FakeClient(responses),
+        st,
+        n_samples=3,
+    )
+    assert pred is not None
+    # 结果与串行聚合等价：均值、采样顺序（gather 返回顺序 = 任务顺序）、samples[0] 归因
+    assert pred.probability == (0.30 + 0.34 + 0.36) / 3
+    assert pred.model_runs["deepseek-flash-websearch"] == [0.30, 0.34, 0.36]
+    assert pred.rationale == "理由一"
+    docs = st.list_question_documents(qid)
+    urls = sorted(d["url"] for d in docs)
+    assert urls == ["https://a/1", "https://b/2", "https://c/3", "https://o/1", "https://o/2"]
+
+
+def test_concurrent_sampling_overlaps_in_time():
+    """两路采样并行：总耗时 ≈ 单次延迟而非 2×（若回归串行，0.8s+ 会超上界失败）。"""
+    st, qid = _st()
+    c = FakeClient(
+        [
+            _msg_response(0.30, "r", ["https://a/1"], []),
+            _msg_response(0.34, "r", ["https://b/2"], []),
+        ],
+        delay=0.4,
+    )
+    t0 = time.monotonic()
+    pred = websearch_predict(
+        qid, "t", datetime(2026, 9, 17, 9, 0), datetime(2026, 8, 13, 20, 0), c, st
+    )
+    elapsed = time.monotonic() - t0
+    assert pred is not None
+    assert elapsed >= 0.3, "采样延迟未生效（测试装置异常）"
+    assert elapsed < 0.75, f"采样疑似串行：耗时 {elapsed:.2f}s（并发应 ≈0.4s）"
+
+
+def test_sync_sample_wrapper_matches_async_path():
+    """串行 _sample 同步封装与解析路径一致（回退兜底/串行基准）。"""
+    raw = _msg_response(0.30, "r", ["https://a/1"], [])
+    s = _sample(
+        "t",
+        datetime(2026, 9, 17, 9, 0),
+        datetime(2026, 8, 13, 20, 0),
+        FakeClient([raw]),
+        None,
+        "",
+    )
+    assert s["probability"] == 0.30
+    assert s["citations"] == ["https://a/1"]
+
+
+def test_heartbeat_lines_go_to_stderr_not_stdout(capsys):
+    """心跳只写 stderr：stdout 零输出（单行 JSON 契约不受污染）。"""
+    st, qid = _st()
+    c = FakeClient(
+        [_msg_response(0.3, "r", ["https://a/1"], []), _msg_response(0.3, "r", ["https://a/1"], [])]
+    )
+    websearch_predict(
+        qid, "t", datetime(2026, 9, 17, 9, 0), datetime(2026, 8, 13, 20, 0), c, st
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "序列拉取阶段结束" in captured.err
+    assert "采样 1/2 完成" in captured.err
+    assert "采样 2/2 完成" in captured.err
+
+
+def test_heartbeat_reports_failed_sample_silently(capsys):
+    """采样失败：心跳打「失败（作废）」行，其余采样照常聚合，无异常外抛。"""
+    st, qid = _st()
+    c = FakeClient(
+        [
+            _msg_response("0.5", "字符串概率", ["https://a/1"], []),  # 非法 → 作废
+            _msg_response(0.40, "正常", ["https://b/2"], []),  # 合法
+        ]
+    )
+    pred = websearch_predict(
+        qid, "t", datetime(2026, 9, 17, 9, 0), datetime(2026, 8, 13, 20, 0), c, st
+    )
+    assert pred is not None and pred.probability == 0.40
+    captured = capsys.readouterr()
+    assert "采样 1/2 失败（作废）" in captured.err
+    assert "采样 2/2 完成" in captured.err

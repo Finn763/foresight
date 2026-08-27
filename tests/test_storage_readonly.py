@@ -1,7 +1,7 @@
 """Storage 只读改造：read_only 连接 + web 展示用只读查询。"""
 
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -114,7 +114,9 @@ def test_latest_prediction_only_in_show_queries(db):
     """预测可更新语义（旧行作废，最后一条计分）：展示查询只取每题最新一条预测。
     回归：原 LEFT JOIN 每题多行（Task 1 遗留顾虑 1，coordinator 裁定为正确性缺口）。"""
     st = Storage(db)  # 写连接补数
-    q = st.add_question("可更新题", datetime(2026, 8, 20))
+    # 动态日期：closes 距今 >7 天会命中延迟归档（不写 brier_score）——
+    # 硬编码日期是时间炸弹（2026-08-27 同文件 :173 已引爆，项目已有教训）
+    q = st.add_question("可更新题", datetime.now() - timedelta(days=1))
     st.add_prediction(q, 0.4, evidence_ids=[1], model_runs={"m": [0.4]})
     second = st.add_prediction(q, 0.9, evidence_ids=[2], model_runs={"m": [0.9]})
     st.resolve_question(q, outcome=True, resolution_source="sina")
@@ -139,7 +141,7 @@ def test_count_metrics_are_question_deduplicated(tmp_path):
     path = str(tmp_path / "e2.db")
     st = Storage(path)
     st.create_schema()
-    q = st.add_question("计数回归题", datetime(2026, 8, 20))
+    q = st.add_question("计数回归题", datetime.now() - timedelta(days=1))
     st.add_prediction(q, 0.4, evidence_ids=[1], model_runs={"m": [0.4]})
     st.add_prediction(q, 0.9, evidence_ids=[2], model_runs={"m": [0.9]})
     st.resolve_question(q, outcome=True, resolution_source="sina")
@@ -159,7 +161,9 @@ def test_websearch_arm_appears_on_public_scoreboard(tmp_path):
     path = str(tmp_path / "e3.db")
     st = Storage(path)
     st.create_schema()
-    q = st.add_question("生产臂出榜题", datetime(2026, 8, 20))
+    # 动态日期（now-1d）：延迟归档规则「closes 距今 >7 天不写 brier_score」
+    # 是时间炸弹——硬编码 2026-08-20 在 8-27 引爆使 :173 断言红（评审报告 §5.1）
+    q = st.add_question("生产臂出榜题", datetime.now() - timedelta(days=1))
     st.add_prediction(
         q, 0.8, evidence_ids=[1], model_runs={"deepseek-flash-websearch": [0.8]}, arm="websearch"
     )

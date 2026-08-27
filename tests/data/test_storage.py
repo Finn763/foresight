@@ -15,7 +15,9 @@ def storage() -> Storage:
 
 
 def test_add_and_resolve_question_updates_brier(storage):
-    qid = storage.add_question("中国9月CPI同比会高于8月吗", datetime(2026, 9, 10))
+    # 动态未来日期：硬编码 2026-9-10 在 closes+7 天后（2026-09-17 起）会命中
+    # 延迟归档不写 brier（时间炸弹，同 test_storage_readonly 8-27 教训）
+    qid = storage.add_question("中国9月CPI同比会高于8月吗", datetime.now() + timedelta(days=14))
     storage.add_prediction(qid, 0.7, evidence_ids=[1], model_runs={"deepseek-chat": 0.7})
     storage.add_document(qid, "gdelt", "http://x", "t", "c", published_at=datetime(2026, 8, 1))
     storage.resolve_question(qid, True, "国家统计局 9/10 公布")
@@ -51,7 +53,7 @@ def test_horizon_buckets_only_count_resolved_public(storage):
 
 
 def test_resolve_scores_only_latest_prediction(storage):
-    qid = storage.add_question("多预测题", datetime(2026, 9, 1))
+    qid = storage.add_question("多预测题", datetime.now() + timedelta(days=5))
     storage.add_prediction(qid, 0.9, evidence_ids=[1], model_runs={"deepseek-chat": 0.9})
     storage.add_prediction(
         qid, 0.1, evidence_ids=[1], model_runs={"deepseek-chat": 0.1}
@@ -66,7 +68,7 @@ def test_resolve_scores_only_baseline_arm(storage):
     """I2：计分只认生产臂（baseline/websearch）——predict_round 先写臂 A 后写臂 B，
     一旦 P1 注册候选杠杆，最后一条恒是 experiment，若不隔离会把实验臂当对外战绩
     （污染 scoreboard 且配对 ΔBrier 地基缺失）。"""
-    qid = storage.add_question("臂隔离题", datetime(2026, 9, 1))
+    qid = storage.add_question("臂隔离题", datetime.now() + timedelta(days=5))
     storage.add_prediction(qid, 0.7, evidence_ids=[1], model_runs={"deepseek-chat": 0.7})
     storage.add_prediction(
         qid, 0.9, evidence_ids=[1], model_runs={"deepseek-chat": 0.9}, arm="experiment", arm_group=1
@@ -85,7 +87,7 @@ def test_resolve_scores_only_baseline_arm(storage):
 def test_resolve_scores_websearch_arm(storage):
     """生产臂计分：websearch 臂是 daily/evolve/pm 题的统一生产入口，最后一条
     websearch 预测必须被计分（旧口径只认 baseline 会让生产战绩永远隐形）。"""
-    qid = storage.add_question("websearch 臂题", datetime(2026, 9, 1))
+    qid = storage.add_question("websearch 臂题", datetime.now() + timedelta(days=5))
     storage.add_prediction(
         qid,
         0.3,

@@ -231,7 +231,7 @@ def _register_internal(app: FastAPI, db_dep) -> None:
             return JSONResponse(status_code=400, content={"detail": "unknown log name"})
         log_path = Path(app.state.db_path).parent / f"{name}.log"
         try:
-            text = log_path.read_text(encoding="gbk", errors="replace")
+            text = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return JSONResponse(status_code=404, content={"detail": "log file not found"})
         return {"name": name, "lines": text.splitlines()[-100:]}

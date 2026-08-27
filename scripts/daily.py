@@ -33,8 +33,9 @@ except ImportError:
     # 兜底：crawler_source 缺失时降级（正常安装必然存在；仅防半成品环境）。
     CrawlerSource = None
 from predictor.llm.client import LLMClient
+from predictor.ops.lock import acquire_lock
+from predictor.ops.manual import manual_candidates
 from predictor.websearch_predictor import predict_with_websearch
-from scripts.evolve import acquire_lock
 
 
 def _build_sources() -> list:
@@ -125,26 +126,6 @@ def _predict_safely(qid: int, st: Storage, client, sources, now: datetime, label
         return None
 
 
-def _manual_candidates(st: Storage, now: datetime) -> list:
-    """到期待揭晓题中需要人工处理的部分：无 spec / class B / class C / A 类 spec 非法
-    （自动揭晓必失败）。合法 A 类由 16:30 auto_resolve 自动揭晓——不进人工清单，
-    防止把自动题提前人工判死（8-14 预演前对抗审计：daily 09:00 清单曾列出 A 类 #67，
-    照提示在美股收盘前填写即永久错判，16:30 自动揭晓被跳过）。"""
-    out = []
-    for q in st.list_open_questions(by=now):
-        try:
-            spec = st.question_resolution(q.id)
-        except Exception:
-            out.append(q)  # spec JSON 损坏 → 无法自动 → 人工（与 auto_resolve 对称防护）
-            continue
-        if spec is None or spec.get("class") != "A":
-            out.append(q)
-            continue
-        if validate_resolution_spec(spec):
-            out.append(q)  # 非法 A spec → 自动揭晓必失败 → 人工
-    return out
-
-
 def _run(args, settings: Settings) -> None:
     print(f"daily started pid={os.getpid()}", flush=True)
     st = Storage(args.db)
@@ -170,7 +151,7 @@ def _run(args, settings: Settings) -> None:
 
     # ② 到期未揭晓 → 人工清单（可自动揭晓的 A 类不列，防收盘前人工错判）+ 自动待定提示
     due = st.list_open_questions(by=now)
-    manual = _manual_candidates(st, now)
+    manual = manual_candidates(st, now)
     manual_ids = {q.id for q in manual}
     auto_due = [q for q in due if q.id not in manual_ids]
     # 模板总是重写（空清单也写表头），避免残留旧清单误导人工流程

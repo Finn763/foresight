@@ -105,3 +105,18 @@ def test_build_facts_rounds_and_files(tmp_path, monkeypatch):
     assert f["lock"] == "stale"
     assert f["scoreboard_date"] == now.date().isoformat()
     assert set(f) == {"rounds", "backlog", "storm", "lock", "scoreboard_date"}
+
+
+def test_build_facts_lock_state_override(tmp_path):
+    """lock_state 关键字参数覆盖：传值直接作为 f["lock"]，跳过锁文件读取——
+    锁文件内容（死 pid）被忽略。"""
+    from datetime import datetime
+
+    from predictor.ops.facts import build_facts
+
+    st = Storage(str(tmp_path / "e.db"))
+    st.create_schema()
+    now = datetime.now()
+    (tmp_path / "evolve.lock").write_text("99999999|0")  # 死 pid：文件判定应为 stale
+    f = build_facts(st, now, lock_state="active")
+    assert f["lock"] == "active"

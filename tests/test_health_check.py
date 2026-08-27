@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -132,3 +133,56 @@ def test_missing_rounds_today_alerts(tmp_path):
     assert r.returncode == 1
     text = list((tmp_path / "data" / "alerts").glob("*.md"))[0].read_text(encoding="utf-8")
     assert "揭晓轮" in text
+
+
+def _seed_clean(tmp_path) -> tuple[Path, datetime]:
+    """照抄 test_clean_rounds_silent 的造数：干净轮次 + 今日 scoreboard。"""
+    st, db = _mkdb(tmp_path)
+    now = datetime(2026, 8, 14, 10, 0)
+    _seed_rounds(st, now)
+    (tmp_path / "data" / "latest_scoreboard.json").write_text(
+        json.dumps({"date": "2026-08-14"}), encoding="utf-8"
+    )
+    _close(st)
+    return db, now
+
+
+def test_waits_for_live_lock_then_fallback_alert(tmp_path):
+    """锁被存活进程持有（测试进程自身 pid）→ 排队到 --lock-wait 上限 → 兜底告警落盘；
+    health 未接管锁（锁文件仍在），且从未打开 DB（无撞库重试痕迹）。"""
+    db, now = _seed_clean(tmp_path)
+    lock = tmp_path / "data" / "evolve.lock"
+    lock.write_text(f"{os.getpid()}|{time.time()}", encoding="utf-8")
+    r = run_hc(db, now, tmp_path, extra=["--lock-wait", "2", "--lock-poll", "1"])
+    assert r.returncode == 1
+    alerts = list((tmp_path / "data" / "alerts").glob("*.md"))
+    assert alerts, "等锁超时应落兜底告警"
+    text = alerts[0].read_text(encoding="utf-8")
+    assert "等锁超时" in text
+    assert lock.exists()  # health 未接管，锁仍由原持有者
+
+
+def test_dead_pid_lock_taken_over_and_cleaned(tmp_path):
+    """持锁进程已死（不存在的 pid）→ 立即接管；finally unlink 清理锁；干净库静默 0。"""
+    db, now = _seed_clean(tmp_path)
+    lock = tmp_path / "data" / "evolve.lock"
+    lock.write_text(f"99999999|{time.time()}", encoding="utf-8")
+    r = run_hc(db, now, tmp_path)
+    assert r.returncode == 0, r.stdout.decode("utf-8", errors="ignore") + r.stderr.decode(
+        "utf-8", errors="ignore"
+    )
+    assert not lock.exists()  # 接管后 finally unlink 清理
+    assert not (tmp_path / "data" / "alerts").exists()
+
+
+def test_corrupt_lock_content_taken_over(tmp_path):
+    """锁内容损坏（无法解析 pid|ts）→ 视为 stale 接管；锁文件被清理；静默 0。"""
+    db, now = _seed_clean(tmp_path)
+    lock = tmp_path / "data" / "evolve.lock"
+    lock.write_text("garbage", encoding="utf-8")
+    r = run_hc(db, now, tmp_path)
+    assert r.returncode == 0, r.stdout.decode("utf-8", errors="ignore") + r.stderr.decode(
+        "utf-8", errors="ignore"
+    )
+    assert not lock.exists()  # 接管后 finally unlink 清理
+    assert not (tmp_path / "data" / "alerts").exists()

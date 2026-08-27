@@ -11,7 +11,6 @@ import csv
 import json
 import os
 import sys
-from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -23,67 +22,11 @@ if hasattr(sys.stdout, "reconfigure"):
 from predictor.config import Settings
 from predictor.data.storage import Storage
 from predictor.memory.levers import get_active_candidate
+from predictor.ops.lock import acquire_lock
 from predictor.pipeline import run_prediction
 from predictor.resolution.auto_resolve import auto_resolve
 from predictor.resolution.spec import validate_resolution_spec
 from predictor.selection.families import difficulty_tier, generate_families
-
-
-def _pid_alive(pid: int) -> bool:
-    """Windows 进程存活检查：OpenProcess 成功 ≠ 存活——被终止进程的对象在父链
-    （venv stub / uv）句柄释放前仍可打开（实测 exitcode=15 已死但 handle 可开），
-    GetExitCodeProcess 的 STILL_ACTIVE(259) 才是权威判据。
-
-    brief 原写法 `os.path.exists(pid)` 在 Windows 上是检查"名为 pid 的文件"恒 False
-    （锁永不生效），落地改用 GetExitCodeProcess：259=存活；已终止（含原生崩溃
-    0xc0000005 后被父链收割）→ 接管，不等 6h stale。
-    """
-    if sys.platform != "win32":
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-    import ctypes
-
-    k32 = ctypes.windll.kernel32
-    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not h:
-        return k32.GetLastError() != 87  # 87=无此 pid（已死）；权限等 → 保守按存活
-    code = ctypes.c_ulong()
-    ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
-    k32.CloseHandle(h)
-    if not ok:
-        return True  # 拿不到退出码 → 保守按存活（宁可拒绝也不双跑）
-    return code.value == 259
-
-
-@contextmanager
-def acquire_lock(lock_path: Path, *, stale_seconds: int = 6 * 3600, caller: str = "evolve"):
-    """文件锁（daily/evolve 双轨共用一把 data/evolve.lock）：
-
-    - 存在且未过 stale 且持锁进程存活 → SystemExit 拒绝（调用方按"对称轨道已覆盖"处理）
-    - 持锁进程已死（原生崩溃 0xc0000005 类）→ 立即接管，不等 6h
-    - stale（>6h 或内容无法解析）→ 接管
-    """
-    import time
-
-    if lock_path.exists():
-        try:
-            pid, ts = lock_path.read_text().strip().split("|")
-            age = time.time() - float(ts)
-            if age < stale_seconds and _pid_alive(int(pid)):
-                raise SystemExit(f"{caller} 已在运行 (pid {pid})")
-        except SystemExit:
-            raise
-        except Exception:
-            pass  # 锁内容损坏/时间戳不可解析 → 视为 stale，接管
-    lock_path.parent.mkdir(parents=True, exist_ok=True)  # data/ 不存在时（新检出）不崩
-    lock_path.write_text(f"{os.getpid()}|{time.time()}")
-    try:
-        yield True
-    finally:
-        lock_path.unlink(missing_ok=True)
 
 
 def _data_dir(st) -> Path:
@@ -272,9 +215,9 @@ def resolve_round(st, *, now: datetime, data_dir: Path | None = None) -> dict:
     # 自动揭晓不列；B 类超宽限已降级 C（同上①）、未超宽限但判定失败/无 client 的 B
     # 与非法 spec 题一并列入待人工；推导内 question_resolution 的 json.loads 由
     # helper 防护。
-    from scripts.daily import _manual_candidates
+    from predictor.ops.manual import manual_candidates
 
-    manual = _manual_candidates(st, now)
+    manual = manual_candidates(st, now)
     dd.mkdir(exist_ok=True)
     tmpl = dd / "resolutions.template.csv"
     with tmpl.open("w", newline="", encoding="utf-8") as f:

@@ -11,11 +11,8 @@ from predictor.data.storage import Storage
 
 @pytest.fixture(autouse=True)
 def _pin_model_settings(monkeypatch):
-    """CC §2.3③：resolve 写 model_stats 前经 canonical_model_name 读 Settings——
-    钉死配置，避免本机 .env 的 DEEPSEEK_MODEL 影响断言（测试可复现性）。"""
-    monkeypatch.setattr(
-        storage_mod, "_load_settings", lambda: SimpleNamespace(deepseek_model="deepseek-chat")
-    )
+    # P0 trim: canonical family removed, fixture is now no-op (kept for compatibility)
+    pass
 
 
 @pytest.fixture()
@@ -306,8 +303,7 @@ def test_model_stats_brier_ema_single_owner(storage):
 
 
 def test_model_stats_brier_ema_multi_model_goes_to_ensemble(storage):
-    """CC §2.3②：多模型 model_runs → 同一管线 Brier 不再分摊给所有模型名，
-    归属保留名 'ensemble'（管线最终概率无单一模型可归属）。"""
+    """CC §2.3② P0 trim: 多模型不再归 ensemble，逐键直写（单模型路径保留）。"""
     qid = storage.add_question("多模型题", datetime.now() + timedelta(days=5))
     storage.add_prediction(
         qid,
@@ -317,19 +313,14 @@ def test_model_stats_brier_ema_multi_model_goes_to_ensemble(storage):
     )
     storage.resolve_question(qid, False, "s")
     stats = storage.model_stats()
-    assert [s["model_name"] for s in stats] == ["ensemble"]
-    assert stats[0]["predictions"] == 1
-    assert stats[0]["brier_ema"] == pytest.approx((0.8 - 0.0) ** 2)
+    assert [s["model_name"] for s in stats] == ["model-a", "model-b"]
+    for s in stats:
+        assert s["predictions"] == 1
+        assert s["brier_ema"] == pytest.approx((0.8 - 0.0) ** 2)
 
 
 def test_model_stats_canonicalizes_legacy_hardcoded_names(storage, monkeypatch):
-    """CC §2.3③：resolve 写 model_stats 不再信任传入的硬编码名，从 Settings 读
-    配置模型名（.env 换模型后统计标签跟随配置，与真实模型不再脱钩）。"""
-    monkeypatch.setattr(
-        storage_mod,
-        "_load_settings",
-        lambda: SimpleNamespace(deepseek_model="deepseek-v4-pro"),
-    )
+    """CC §2.3③ P0 trim: 已移除 canonical 映射，历史硬编码名原样保留不合并。"""
     q1 = storage.add_question("经典管线题", datetime.now() + timedelta(days=5))
     storage.add_prediction(q1, 0.7, evidence_ids=[1], model_runs={"deepseek-chat": [0.7]})
     storage.resolve_question(q1, True, "s")
@@ -349,14 +340,12 @@ def test_model_stats_canonicalizes_legacy_hardcoded_names(storage, monkeypatch):
     storage.resolve_question(q3, True, "s")
 
     stats = {s["model_name"]: s for s in storage.model_stats()}
-    # 两个历史硬编码名映射到同一配置模型名（同一客户端）→ 合并进同一行
-    assert "deepseek-chat" not in stats
-    assert "deepseek-flash-websearch" not in stats
-    assert stats["deepseek-v4-pro"]["predictions"] == 2
-    assert stats["deepseek-v4-pro"]["brier_ema"] == pytest.approx(
-        ((0.7 - 1.0) ** 2 * 9 + (0.3 - 1.0) ** 2) / 10  # EMA α=0.1 递推
-    )
-    assert stats["my-model"]["predictions"] == 1  # 已配置名原样保留
+    # P0 trim 后不再合并到配置名，各硬编码名独立计数
+    assert stats["deepseek-chat"]["predictions"] == 1
+    assert stats["deepseek-chat"]["brier_ema"] == pytest.approx((0.7 - 1.0) ** 2)
+    assert stats["deepseek-flash-websearch"]["predictions"] == 1
+    assert stats["deepseek-flash-websearch"]["brier_ema"] == pytest.approx((0.3 - 1.0) ** 2)
+    assert stats["my-model"]["predictions"] == 1
     assert stats["my-model"]["brier_ema"] == pytest.approx((0.5 - 1.0) ** 2)
 
 

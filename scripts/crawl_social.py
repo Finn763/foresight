@@ -196,7 +196,9 @@ def _run_mediacrawler(
             continue
         for p in base.rglob("*.json"):
             try:
-                if p.stat().st_mtime < t0:
+                # ponytail: 1s 容差——Windows mtime 时钟精度与 time.time() 差一个 tick，
+                # 真实抓取 >30s 无影响，fake 测试 1ms 写入否则 flaky
+                if p.stat().st_mtime < t0 - 1.0:
                     continue
             except OSError:
                 continue

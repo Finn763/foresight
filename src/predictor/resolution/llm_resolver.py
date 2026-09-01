@@ -70,7 +70,7 @@ class LLMResolver:
             now_iso=now.isoformat(timespec="seconds"),
         )
         raw = self._client.responses_create(
-            input="请判定：该事件在截止时间前是否成立？",
+            input="请判定：该事件在截止时间前是否成立？输出 JSON：{\"outcome\": true/false, \"confidence\": 0-1, \"citations\": []}",
             instructions=instructions,
             tools=[{"type": "web_search"}],
             tool_choice={"type": "web_search"},

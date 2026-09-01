@@ -112,6 +112,22 @@ body {
 }
 #error-banner[hidden] { display: none; }
 
+/* ---------- 告警横幅（health告警，style.css 承载避免 inline style） ---------- */
+#alert-banner {
+  background: #121722; border: 1px solid #ff6b6b; border-radius: 8px;
+  color: #e8ecf4; margin: 10px 14px 0; padding: 10px 14px; font-size: 13px;
+  display: flex; gap: 12px; align-items: flex-start;
+}
+#alert-banner .alert-body { flex: 1; min-width: 0; }
+#alert-banner .alert-title { color: #ff6b6b; font-weight: 600; margin-bottom: 4px; }
+#alert-banner .alert-time { color: #96a0b5; font-weight: 400; margin-left: 8px; }
+#alert-banner .alert-list { margin: 0; padding-left: 18px; }
+#alert-banner form { margin: 0; }
+#alert-banner button {
+  background: #ff6b6b; color: #0a0d14; border: 0; border-radius: 6px;
+  padding: 4px 10px; cursor: pointer; font-size: 12px;
+}
+
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 
 /* ---------- 主体 ---------- */

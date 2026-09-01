@@ -7,7 +7,7 @@ packages = ["src/predictor"]
 
 [project]
 name = "predictor"
-version = "0.1.0"
+version = "0.3.0"
 description = "Foresight prediction agent engine (Halawi pipeline + Brier track record)"
 requires-python = ">=3.12,<3.14"
 dependencies = [

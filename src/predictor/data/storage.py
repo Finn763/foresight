@@ -20,54 +20,6 @@ class Question:
     is_public: bool
 
 
-# ---- 模型名配置化（CC §2.3③ 落点，2026-08-27）----
-# 所有预测路径（cli.py / scripts/daily.py / scripts/backtest.py）统一用
-# Settings.llm_client_kwargs 构造 LLMClient，即真实产出预测的模型恒为
-# Settings().deepseek_model。pipeline.py:137 与 websearch_predictor.py 写入
-# model_runs 的键仍是历史硬编码（"deepseek-chat" / "deepseek-flash-websearch"，
-# 两文件不在本任务边界）：storage 侧记录 model_stats 时不再信任传入的硬编码名，
-# 统一从 Settings 解析，.env 换模型后统计标签不再与实际脱钩。
-
-_LEGACY_MODEL_HARDCODES = frozenset({"deepseek-chat", "deepseek-flash-websearch"})
-
-# 多模型 model_runs 时 brier_ema 的归属名（管线最终概率无单一模型可归属，CC §2.3②）
-_ENSEMBLE_OWNER = "ensemble"
-
-
-def _load_settings():
-    """Settings 工厂（独立函数，便于测试 monkeypatch 钉死配置）。"""
-    from predictor.config import Settings
-
-    return Settings()
-
-
-def get_model_name() -> str:
-    """真实产出预测的模型名（单一事实源：Settings().deepseek_model）。
-
-    供 pipeline.py / websearch_predictor.py 后续切换：model_runs 的键应直接用本函数
-    返回值而非硬编码字符串（两文件不在本任务边界，暂由 canonical_model_name 兜底）。
-    """
-    return _load_settings().deepseek_model
-
-
-def canonical_model_name(name: str) -> str:
-    """历史硬编码模型名 → 配置模型名（CC §2.3③）。
-
-    "deepseek-chat"（pipeline.py:137）与 "deepseek-flash-websearch"
-    （websearch_predictor.py）实际都跑在 Settings().deepseek_model 上（预测路径
-    共用同一客户端），统一映射到配置值；其他名字视为已配置名原样保留（未来真多
-    模型时调用方直接写入 get_model_name() 的返回值即可）。Settings 不可用或配置
-    为空时回退原名，不阻塞揭晓（model_stats 只影响在线权重）。
-    """
-    if name not in _LEGACY_MODEL_HARDCODES:
-        return name
-    try:
-        configured = get_model_name()
-    except Exception:
-        return name
-    return configured or name
-
-
 class Storage:
     def __init__(self, db_path: str, *, read_only: bool = False):
         if db_path != ":memory:":
@@ -344,17 +296,21 @@ class Storage:
                 "             ORDER BY created_at DESC, id DESC LIMIT 1)",
                 [int(outcome), int(outcome), question_id],
             )
-            # 在线权重（EMA α=0.1）：model_stats 按 brier_ema 归属口径（CC §2.3②修正）
-            # 写入——brier 是「管线最终概率」（ensemble+extremize+校准后）的 Brier：
-            # 单模型（现状）归属该模型名（canonical_model_name 转配置名，CC §2.3③）；
-            # 多模型集成归属保留名 'ensemble'，不再把同一 Brier 分摊给所有模型名。
             rows = self._conn.execute(
                 "SELECT model_runs, brier_score FROM predictions "
                 "WHERE question_id = ? AND brier_score IS NOT NULL",
                 [question_id],
             ).fetchall()
             for mr_json, brier in rows:
-                for mname in self._brier_owner_names(mr_json):
+                try:
+                    mr = json.loads(mr_json or "{}")
+                except Exception as e:
+                    raise ValueError(f"model_runs JSON 损坏: {e}") from None
+                if not isinstance(mr, dict):
+                    raise ValueError(f"model_runs 非对象: {type(mr).__name__}")
+                for mname in list(mr.keys()):
+                    if not isinstance(mname, str) or not mname:
+                        continue
                     self._conn.execute(
                         "INSERT INTO model_stats (model_name, predictions, brier_ema, last_updated) "
                         "VALUES (?, 1, ?, CURRENT_TIMESTAMP) "
@@ -381,31 +337,6 @@ class Storage:
                 )
             except Exception:
                 pass
-
-    @staticmethod
-    def _brier_owner_names(model_runs_json: str | None) -> list[str]:
-        """brier_ema 归属的模型名列表（CC §2.3②修正，2026-08-27）。
-
-        - 空 dict / SQL NULL（model_runs 未记录）→ []（不写 stats）；
-        - 损坏 / 非对象（如 JSON null）→ raise：沿用既有降级契约——resolve_question
-          计分段 catch 后记 resolution_brier_failed，暴露残缺可人工后补；
-        - 恰好一个模型键（现状：单模型多采样集成）→ 该键经 canonical_model_name
-          转为配置模型名（CC §2.3③）；
-        - 多个模型键（未来真多模型集成）→ ['ensemble']：管线最终概率不归属任何
-          单一模型，逐个分摊同一 Brier 是语义失真。
-        """
-        try:
-            mr = json.loads(model_runs_json or "{}")
-        except Exception as e:
-            raise ValueError(f"model_runs JSON 损坏: {e}") from None
-        if not isinstance(mr, dict):
-            raise ValueError(f"model_runs 非对象: {type(mr).__name__}")
-        names = [k for k in mr if isinstance(k, str) and k]
-        if not names:
-            return []
-        if len(names) == 1:
-            return [canonical_model_name(names[0])]
-        return [_ENSEMBLE_OWNER]
 
     # ---- predictions ----
     def add_prediction(
@@ -578,34 +509,33 @@ class Storage:
         )
 
     def ops_backlog(self, now: datetime) -> dict:
-        """积压事实：A/B 类到期且超出 closes+grace 仍未降级（揭晓轮失能信号；
-        2026-08-20 起 B 类纳入——B 类 LLM 揭晓失败同样依赖 16:30 轮宽限降级，
-        只盯 A 会漏掉 #9 这类挂起）；未揭晓且无预测的死题 id 列表。
-        grace_days 非数值回退 3 天（与 evolve 同语义）。"""
-        past_grace_a = 0
-        for q in self.list_open_questions(by=now):
-            try:
-                spec = self.question_resolution(q.id)
-            except Exception:
-                continue
-            if spec is None or spec.get("class") not in ("A", "B"):
-                continue
-            try:
-                grace = int(spec.get("grace_days", 3))
-            except (TypeError, ValueError):
-                grace = 3
-            if now > q.closes_at + timedelta(days=grace):
-                past_grace_a += 1
-        dead = [q.id for q in self.list_unresolved() if self.count_predictions(q.id) == 0]
+        """积压事实：A/B 类到期且超出 closes+grace 仍未降级；未揭晓且无预测的死题。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM questions "
+            "WHERE outcome IS NULL AND closes_at <= ? "
+            "AND json_extract_string(resolution_spec, '$.class') IN ('A', 'B') "
+            "AND ? > closes_at + INTERVAL (COALESCE(TRY_CAST(json_extract_string(resolution_spec, '$.grace_days') AS INTEGER), 3) || ' days')::INTERVAL",
+            [now, now],
+        ).fetchone()
+        past_grace_a = int(row[0]) if row else 0
+        dead_rows = self._conn.execute(
+            "SELECT q.id FROM questions q WHERE q.outcome IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM predictions p WHERE p.question_id = q.id)"
+        ).fetchall()
+        dead = [r[0] for r in dead_rows]
         return {"past_grace_a": past_grace_a, "dead_ids": dead}
 
     def ops_storm(self, now: datetime) -> int:
         """未来 48h 内将触发 7 天更新重预测的未到期题数（与 7 天规则同口径的日历天）。"""
+        rows = self._conn.execute(
+            "SELECT MAX(p.created_at) FROM questions q "
+            "JOIN predictions p ON p.question_id = q.id "
+            "WHERE q.outcome IS NULL AND q.closes_at > ? "
+            "GROUP BY q.id",
+            [now],
+        ).fetchall()
         n = 0
-        for q in self.list_unresolved():
-            if q.closes_at <= now:
-                continue
-            last = self.last_prediction_at(q.id)
+        for (last,) in rows:
             if last is not None and 5 <= (now - last).days < 7:
                 n += 1
         return n
@@ -725,32 +655,19 @@ class Storage:
     def source_market_ids(self, source: str) -> set[str]:
         """指定来源（resolution_spec.source）已入库的 market_id 集合，供拉题判重。"""
         rows = self._conn.execute(
-            "SELECT resolution_spec FROM questions WHERE resolution_spec IS NOT NULL"
+            "SELECT json_extract_string(resolution_spec, '$.market_id') "
+            "FROM questions WHERE json_extract_string(resolution_spec, '$.source') = ?",
+            [source],
         ).fetchall()
-        ids: set[str] = set()
-        for (raw,) in rows:
-            try:
-                spec = json.loads(raw)
-            except Exception:
-                continue
-            if isinstance(spec, dict) and spec.get("source") == source and spec.get("market_id"):
-                ids.add(str(spec["market_id"]))
-        return ids
+        return {str(r[0]) for r in rows if r[0] is not None}
 
     def source_question_ids(self, source: str) -> list[int]:
         """指定来源（resolution_spec.source）的全部题 id，供揭晓轮枚举。"""
         rows = self._conn.execute(
-            "SELECT id, resolution_spec FROM questions WHERE resolution_spec IS NOT NULL"
+            "SELECT id FROM questions WHERE json_extract_string(resolution_spec, '$.source') = ?",
+            [source],
         ).fetchall()
-        out: list[int] = []
-        for qid, raw in rows:
-            try:
-                spec = json.loads(raw)
-            except Exception:
-                continue
-            if isinstance(spec, dict) and spec.get("source") == source:
-                out.append(int(qid))
-        return out
+        return [int(r[0]) for r in rows]
 
     def last_prediction_at(self, question_id: int) -> datetime | None:
         row = self._conn.execute(

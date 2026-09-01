@@ -1,6 +1,7 @@
 """验证从 forecastbench-datasets 真实结构 JSON 解析出 BenchQuestion 列表。"""
 
 import httpx
+from pathlib import Path
 
 from predictor.data.benchmarks import BenchQuestion, fetch_forecastbench_questions
 
@@ -62,9 +63,16 @@ def test_parse_outcome_when_resolution_present():
 
 
 def test_local_seed_fallback():
-    """网络失败时降级本地 seed（data/fb_seed/ 已从官方仓库整包落盘）。"""
+    """网络失败时降级本地 seed（data/fb_seed/ 已从官方仓库整包落盘）。
+
+    fb_seed 不入库（.gitignore /data/），全新克隆无此目录 → skip；
+    有落盘 seed 的机器才验证降级路径。"""
+    import pytest
+
     from predictor.data.benchmarks import _load_local_seed
 
+    if not (Path(__file__).resolve().parents[2] / "data" / "fb_seed").is_dir():
+        pytest.skip("data/fb_seed/ 未落盘（不入库），跳过本地 seed 降级测试")
     questions = _load_local_seed(limit=5)
     assert len(questions) >= 1
     assert all(isinstance(q, BenchQuestion) for q in questions)

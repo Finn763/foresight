@@ -52,7 +52,7 @@ jobs:
           V="${GITHUB_REF_NAME#v}"
           [ "${{ github.event_name }}" = "workflow_dispatch" ] && V="${{ github.event.inputs.version }}"
           mkdir -p pkg/bin
-          cp dist/foresight* pkg/bin/foresight${{ runner.os == 'windows' && '.exe' || '' }}
+          cp dist/foresight* pkg/bin/foresight${{ runner.os == 'Windows' && '.exe' || '' }}
           sed -e "s/0.3.0/${V}/g" \
               -e "s/foresight-agent-win32-x64/foresight-agent-${{ matrix.pkg }}/g" \
               packaging/npm/foresight-agent-win32-x64/package.json > pkg/package.json

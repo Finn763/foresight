@@ -1,0 +1,29 @@
+{
+  "name": "foresight-agent",
+  "version": "0.3.0",
+  "description": "Foresight prediction agent engine — Halawi pipeline + Brier track record, learn your coding taste.",
+  "license": "MIT",
+  "bin": {
+    "foresight": "bin/foresight.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "optionalDependencies": {
+    "foresight-agent-win32-x64": "0.3.0",
+    "foresight-agent-darwin-x64": "0.3.0",
+    "foresight-agent-darwin-arm64": "0.3.0",
+    "foresight-agent-linux-x64": "0.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "prediction",
+    "forecasting",
+    "agent",
+    "brier",
+    "claude",
+    "cli"
+  ]
+}

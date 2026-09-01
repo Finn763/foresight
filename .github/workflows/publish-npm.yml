@@ -1,0 +1,81 @@
+# 构建并发布 foresight-agent 平台二进制包到 npm。
+# 用法：手动触发 workflow_dispatch（或推 tag v* 自动跑），
+# 三个平台并行构建，产物各自 publish 为 foresight-agent-<platform>-<arch>。
+# 发布后需手动 `npm publish` 主包 foresight-agent（版本与子包一致）。
+name: publish-npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "子包版本（与主包一致）"
+        required: true
+        default: "0.3.0"
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            pkg: win32-x64
+          - os: macos-13
+            pkg: darwin-x64
+          - os: macos-latest
+            pkg: darwin-arm64
+          - os: ubuntu-latest
+            pkg: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Build binary (PyInstaller)
+        run: uv run --with pyinstaller pyinstaller --onefile --name foresight --paths src --collect-all duckdb --collect-all pydantic_core --hidden-import dotenv packaging/entry.py
+
+      # Linux 上 arm64 需交叉编译，单独 job：
+      # - name: Build arm64 (aarch64-unknown-linux-gnu)
+      #   if: ...
+      #   run: uv pip install --target ... aarch64 python musl 交叉链（如 pyinstaller 官方 aarch64 预编译 bootloader）
+
+      - name: Stage npm package
+        shell: bash
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && V="${{ github.event.inputs.version }}"
+          mkdir -p pkg/bin
+          cp dist/foresight* pkg/bin/foresight${{ runner.os == 'windows' && '.exe' || '' }}
+          sed -e "s/0.3.0/${V}/g" \
+              -e "s/foresight-agent-win32-x64/foresight-agent-${{ matrix.pkg }}/g" \
+              packaging/npm/foresight-agent-win32-x64/package.json > pkg/package.json
+          echo "files = []" > .npmignore
+
+      - name: Publish
+        run: npm publish pkg/
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-main:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish main package
+        run: npm publish packaging/npm/foresight-agent/
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

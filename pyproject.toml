@@ -20,6 +20,9 @@ dependencies = [
     "uvicorn>=0.52.1",
 ]
 
+[project.scripts]
+foresight = "predictor.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest",

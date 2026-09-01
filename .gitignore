@@ -8,6 +8,8 @@ __pycache__/
 /data/
 *.db
 dist/
+build/
+*.spec
 
 # Hermes desktop metadata
 .reasonix/

@@ -22,7 +22,7 @@ jobs:
         include:
           - os: windows-latest
             pkg: win32-x64
-          - os: macos-13
+          - os: macos-15-intel
             pkg: darwin-x64
           - os: macos-latest
             pkg: darwin-arm64
@@ -51,17 +51,21 @@ jobs:
         run: |
           V="${GITHUB_REF_NAME#v}"
           [ "${{ github.event_name }}" = "workflow_dispatch" ] && V="${{ github.event.inputs.version }}"
+          EXT=${{ runner.os == 'Windows' && '".exe"' || '""' }}
           mkdir -p pkg/bin
-          cp dist/foresight* pkg/bin/foresight${{ runner.os == 'Windows' && '.exe' || '' }}
+          cp dist/foresight* pkg/bin/foresight${EXT}
           sed -e "s/0.3.0/${V}/g" \
               -e "s/foresight-agent-win32-x64/foresight-agent-${{ matrix.pkg }}/g" \
+              -e "s/bin\/foresight\.exe/bin\/foresight${EXT}/g" \
               packaging/npm/foresight-agent-win32-x64/package.json > pkg/package.json
-          echo "files = []" > .npmignore
+
+      - name: Configure npm auth
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish
         run: npm publish pkg/
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-main:
     needs: build
@@ -75,7 +79,10 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
-      - name: Publish main package
-        run: npm publish packaging/npm/foresight-agent/
+      - name: Configure npm auth
+        run: echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish main package
+        run: npm publish packaging/npm/foresight-agent/

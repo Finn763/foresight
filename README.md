@@ -40,6 +40,15 @@ foresight/
 
 ## Quick start
 
+### 0. One-line install (npm, no Python required)
+
+```
+npm i -g foresight-agent
+foresight "美联储9月会加息吗" --closes 2026-09-17
+```
+
+Prebuilt binaries (Windows/macOS/Linux, incl. Apple Silicon) are fetched per-platform; Python runtime is bundled. Requires Node 18+ and an API key — copy `.env.example` to `.env` and set `DEEPSEEK_API_KEY` (or export it).
+
 ### 1. Python engine
 
 ```bash

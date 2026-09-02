@@ -40,14 +40,14 @@ foresight/
 
 ## Quick start
 
-### 0. One-line install (npm, no Python required)
+### 0. Quick install (npm, no Python or uv needed)
 
-```
+```bash
 npm i -g foresight-agent
-foresight "美联储9月会加息吗" --closes 2026-09-17
+foresight "Will the Fed cut rates in September?" --closes 2026-09-17
 ```
 
-Prebuilt binaries (Windows/macOS/Linux, incl. Apple Silicon) are fetched per-platform; Python runtime is bundled. Requires Node 18+ and an API key — copy `.env.example` to `.env` and set `DEEPSEEK_API_KEY` (or export it).
+The npm installer fetches a prebuilt, self-contained binary for your platform (Windows x64, macOS x64/arm64, Linux x64) — the Python runtime and all dependencies are bundled inside, so no Python, uv, or package manager setup is required. To use your own API key, copy `.env.example` to `.env` and set `DEEPSEEK_API_KEY`, or set it as an environment variable.
 
 ### 1. Python engine
 

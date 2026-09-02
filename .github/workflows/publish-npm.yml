@@ -60,8 +60,9 @@ jobs:
               packaging/npm/foresight-agent-win32-x64/package.json > pkg/package.json
 
       - name: Configure npm auth
+        shell: bash
         run: |
-          npm config set //registry.npmjs.org/:_authToken ${NPM_TOKEN}
+          npm config set //registry.npmjs.org/:_authToken $NPM_TOKEN
           npm whoami
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -82,8 +83,9 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Configure npm auth
+        shell: bash
         run: |
-          npm config set //registry.npmjs.org/:_authToken ${NODE_AUTH_TOKEN}
+          npm config set //registry.npmjs.org/:_authToken $NODE_AUTH_TOKEN
           npm whoami
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

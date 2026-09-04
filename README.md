@@ -66,6 +66,13 @@ python scripts/web_server.py                 # internal mode http://127.0.0.1:87
 python scripts/web_server.py --mode public   # public scoreboard (internal APIs 404)
 ```
 
+Or double-click `open_dashboard.bat` (Windows): starts the server in a terminal
+window and opens the browser; closing the window stops the server. If port 8765
+is already serving, it just opens the browser.
+Frontend files live in `src/predictor/web/static/` (`index.html` + `app.js` +
+`style.css`, no build step). Internal mode exposes ops pages (health, logs,
+manual resolve); public mode serves the scoreboard only.
+
 Command-line prediction:
 
 ```bash

@@ -1,5 +1,30 @@
 "use strict";
 // Foresight 展示页前端：内部视图（看板/详情/系统）+ 写窗口 503 自动重试。
+// ---- 主题：白天/夜间切换（默认白天，localStorage 记忆） ----
+// ponytail: CSP 禁 inline head 脚本，主题在 app.js 首行生效；首屏顶栏可能闪一帧深色，内容渲染不受影响。
+function setTheme(t) {
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("fs-theme", t); } catch (e) { /* 隐私模式无存储 */ }
+  const m = document.querySelector('meta[name="theme-color"]');
+  if (m) m.content = t === "light" ? "#edf1f7" : "#0a0d14";
+}
+let initTheme = "light";
+try { initTheme = localStorage.getItem("fs-theme") || "light"; } catch (e) { /* 同上 */ }
+setTheme(initTheme);
+function mountThemeToggle() {
+  const box = $("#mode-switch");
+  if (!box || $("#theme-toggle")) return;
+  const b = document.createElement("button");
+  b.id = "theme-toggle";
+  b.setAttribute("aria-label", "切换白天/夜间主题");
+  const paint = () => { b.textContent = document.documentElement.dataset.theme === "light" ? "🌙 夜间" : "☀️ 白天"; };
+  b.addEventListener("click", () => {
+    setTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+    paint();
+  });
+  paint();
+  box.prepend(b);
+}
 const $ = (sel) => document.querySelector(sel);
 const mode = new URLSearchParams(location.search).get("mode");
 
@@ -291,6 +316,7 @@ async function renderPublic() {
   const { items } = await fetchJSON("/api/public/resolved");
   document.querySelectorAll(".tab").forEach((t) => (t.style.display = "none"));
   $("#mode-switch").innerHTML = `<a href="?"><button>← 内部视图</button></a>`;
+  mountThemeToggle();
   $("#app").innerHTML = `
     <div class="card stat-strip">
       <div class="stat"><span class="stat-label">已揭晓</span><span class="stat-value">${s.resolved}</span></div>
@@ -325,6 +351,7 @@ async function init() {
   if (view === "public") renderPublic();
   else {
     $("#mode-switch").innerHTML = `<a href="?mode=public"><button>对外视图 →</button></a>`;
+    mountThemeToggle();
     document.querySelectorAll(".tab").forEach((t) =>
       t.addEventListener("click", async () => {
         document.querySelectorAll(".tab").forEach((x) => {

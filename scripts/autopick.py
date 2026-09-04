@@ -273,7 +273,7 @@ class LLM:
             raise RuntimeError("缺少 LLM API key（检查 .env 或 --env-file）")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/") or "https://api.deepseek.com"
-        self.model = model or "deepseek-chat"
+        self.model = model or "deepseek-v4-flash"
 
     def chat_json(self, prompt: str, *, temperature: float, max_tokens: int = 8192) -> dict:
         url = f"{self.base_url}/v1/chat/completions"

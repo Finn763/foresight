@@ -57,6 +57,11 @@ python scripts/web_server.py                 # 内部模式 http://127.0.0.1:876
 python scripts/web_server.py --mode public   # 对外战绩榜（内部 API 一律 404）
 ```
 
+或双击 `open_dashboard.bat`（Windows）：弹终端窗口启动服务并自动打开浏览器，
+关闭窗口即停服；若 8765 端口已有服务则只打开浏览器。
+前端文件在 `src/predictor/web/static/`（`index.html` + `app.js` + `style.css`，
+无构建步骤）。内部模式含运维页（健康检查、系统日志、人工揭晓），对外模式仅战绩榜。
+
 命令行预测：
 
 ```bash

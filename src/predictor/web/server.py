@@ -115,19 +115,27 @@ def create_app(mode: str = "internal") -> FastAPI:
     @app.get("/")
     def index():
         html_path = STATIC_DIR / "index.html"
-        # 告警横幅只注入 internal 模式（public 战绩榜不暴露内部运维信息）
-        if app.state.mode != "internal":
-            return FileResponse(html_path)
         try:
             html = html_path.read_text(encoding="utf-8")
         except OSError:
             return FileResponse(html_path)
+        # 静态资源 mtime 版本号：文件一改 URL 就变，浏览器缓存即失效
+        #（根治“改完前端不生效”；query 不影响 StaticFiles 取文件）。
+        for asset in ("style.css", "app.js"):
+            try:
+                v = int((STATIC_DIR / asset).stat().st_mtime)
+            except OSError:
+                continue
+            html = html.replace(f"/static/{asset}", f"/static/{asset}?v={v}", 1)
+        # 告警横幅只注入 internal 模式（public 战绩榜不暴露内部运维信息）
+        if app.state.mode != "internal":
+            return HTMLResponse(html, headers={"cache-control": "no-cache"})
         alert = _latest_unack_alert(Path(app.state.db_path).parent / "alerts")
         if alert is None:
-            return HTMLResponse(html)
+            return HTMLResponse(html, headers={"cache-control": "no-cache"})
         mk = '<main id="app"></main>'
         html = html.replace(mk, _render_alert_banner(alert) + mk, 1)
-        return HTMLResponse(html)
+        return HTMLResponse(html, headers={"cache-control": "no-cache"})
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app

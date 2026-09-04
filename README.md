@@ -2,7 +2,7 @@
 
 [中文文档](README.zh-CN.md) | English
 
-Opinion/event probability prediction system: event in → probability + timeline + sourced report out. Brier track record publicly verifiable.
+Opinion/event probability prediction system: event in → probability + timeline + sourced report out. Brier-scored track record (local dashboard; public verification page planned).
 
 Architecture = **pi-fork interactive agent shell** (`shell/pi`, renamed `@foresight/foresight-agent`) + **Python prediction engine** (`src/predictor`: Halawi-style RAG pipeline + multi-model ensemble + calibration + backtesting). The agent invokes the Python engine through an extension bridge (`.foresight/extensions/foresight-tools.ts`).
 
@@ -19,7 +19,7 @@ Architecture = **pi-fork interactive agent shell** (`shell/pi`, renamed `@foresi
 - **Prediction pipeline**: Halawi five-step (search-term generation → retrieval → relevance filtering → summarization → base-rate + prediction) + 5–12 model ensemble + order-preserving calibration layer
 - **Methods ranked by measured evidence**: RAG retrieval (+50%) > multi-model ensemble median > superforecaster prompting > probability extremization > market/crowd priors
 - **Resolution loop**: class A dual-source market-data comparison / class B LLM resolver (web_search evidence + dual-sampling agreement + confidence guardrail) / class C manual fallback; Brier scores and calibration curves update automatically as questions resolve
-- **Backtesting**: zero-shot on the public ForecastBench question bank (leak-safe benchmark; seed data in `data/fb_seed/`)
+- **Backtesting**: zero-shot on the public ForecastBench question bank (leak-safe benchmark; seed snapshots live in local `data/fb_seed/`, excluded from the public mirror)
 - **Question sourcing**: Polymarket Gamma API pipeline **plus an autonomous topic-selection engine** (`scripts/autopick.py`) — RSS aggregation (20 sources) → LLM screening & scoring → question drafting with verifiable resolution criteria → registry-based dedup → daily brief (`data/daily-brief.md`)
 - **Ops**: daily prediction/evolution rounds + health checks (queue-on-lock via `predictor.ops.lock.wait_acquire` instead of blind-fail retries); headless Windows schtasks orchestration via `scripts/run_silent.py`
 

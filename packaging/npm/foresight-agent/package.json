@@ -1,7 +1,7 @@
 {
   "name": "foresight-agent",
   "version": "0.3.1",
-  "description": "Foresight prediction agent engine — Halawi pipeline + Brier track record, learn your coding taste.",
+  "description": "Foresight prediction agent engine — event probability prediction with Brier-scored track record.",
   "license": "MIT",
   "bin": {
     "foresight": "bin/foresight.js"
@@ -23,7 +23,6 @@
     "forecasting",
     "agent",
     "brier",
-    "claude",
     "cli"
   ]
 }

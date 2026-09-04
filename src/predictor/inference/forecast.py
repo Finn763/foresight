@@ -30,7 +30,7 @@ def forecast(
     client: Any,
     *,
     prior: float | None = None,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
     historical_context: str = "",
     baseline: dict | None = None,
 ) -> ForecastResult:

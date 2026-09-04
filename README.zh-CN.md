@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-舆情/事件概率预测系统：输入事件 → 输出概率 + 时间线 + 可溯源报告，Brier 战绩公开可验证。
+舆情/事件概率预测系统：输入事件 → 输出概率 + 时间线 + 可溯源报告，Brier 计分战绩（本地看板；公开验证页规划中）。
 
 架构 = **pi-fork 交互 agent 外壳**（`shell/pi`，改名 `@foresight/foresight-agent`）+ **Python 预测引擎**（`src/predictor`，Halawi 式 RAG 管线 + 多模型集成 + 校准 + 回测），agent 通过工具扩展桥（`.foresight/extensions/foresight-tools.ts`）调用 Python 引擎。
 
@@ -19,7 +19,7 @@
 - **预测管线**：Halawi 五步（搜索词生成 → 检索 → 相关性过滤 → 摘要 → 基准率+预测）+ 5–12 模型集成 + 保序校准层
 - **有效方法按证据强度**：RAG 检索（+50%）> 多模型集成取中位数 > 超级预测者提示词 > 概率极端化 > 市场/人群先验
 - **战绩闭环**：A 类双源行情比对 / B 类 LLM 揭晓器（web_search 证据 + 双采样一致 + 置信护栏）/ C 类人工兜底；Brier 分数与校准曲线随揭晓自动更新
-- **回测**：ForecastBench 公开题库零样本回测（防泄漏基准；种子数据见 `data/fb_seed/`）
+- **回测**：ForecastBench 公开题库零样本回测（防泄漏基准；种子快照在本地 `data/fb_seed/`，公开镜像不含）
 - **选题管线**：Polymarket Gamma API 拉活跃市场 → horizon 三档筛选 → LLM 译中文入题池；另有**自主选题引擎** `scripts/autopick.py`（RSS 聚合 20 源 → LLM 筛选打分 → 出题含可查证揭晓条件 → 注册表判重 → 每日简报）
 - **运维**：每日预测轮/揭晓轮/健康巡检三件套；健康巡检 `wait_acquire` 排队等锁（杜绝对撞失明）；Windows schtasks 无窗口编排见 `scripts/run_silent.py`
 

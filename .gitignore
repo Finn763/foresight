@@ -13,3 +13,11 @@ build/
 
 # Hermes desktop metadata
 .reasonix/
+
+# Never publish: commercial docs, decks, local ops state (public mirror = code only)
+*.log
+deck/
+deliverables/
+assets/
+docs/STATUS.md
+docs/预测Agent-*

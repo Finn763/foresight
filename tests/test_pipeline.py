@@ -83,7 +83,7 @@ def test_run_prediction_keeps_all_samples_in_model_runs():
     store = FakeStore()
     pred = run_prediction(1, store, FakeClient(), [FakeSource()], now=datetime(2026, 8, 2))
     assert pred is not None
-    assert pred.model_runs["deepseek-chat"] == [0.55, 0.55, 0.55]  # n_samples=3 全量采样
+    assert pred.model_runs["deepseek-v4-flash"] == [0.55, 0.55, 0.55]  # n_samples=3 全量采样
     assert store.preds == [pred.probability]
 
 

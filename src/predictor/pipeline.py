@@ -74,7 +74,7 @@ def run_prediction(
     runs: list[ForecastResult] = []
     for i in range(n_samples):
         try:
-            runs.append(forecast(q.title, summaries, client, prior=prior, model=client.model if hasattr(client, "model") else "deepseek-chat", historical_context=historical_context, baseline=baseline))
+            runs.append(forecast(q.title, summaries, client, prior=prior, model=client.model if hasattr(client, "model") else "deepseek-v4-flash", historical_context=historical_context, baseline=baseline))
         except ValueError:
             continue
     if not runs:
@@ -91,6 +91,6 @@ def run_prediction(
     if not evidence_ids:
         return None
     sample_probs = [r.probability for r in runs]
-    pid = storage.add_prediction(question_id, prob, evidence_ids=evidence_ids, model_runs={"deepseek-chat": sample_probs}, arm=arm, arm_group=arm_group)
+    pid = storage.add_prediction(question_id, prob, evidence_ids=evidence_ids, model_runs={"deepseek-v4-flash": sample_probs}, arm=arm, arm_group=arm_group)
     report = generate_report(q.title, prob, runs[0].rationale, summaries, relevant, prior, runs=runs, baseline=baseline)
-    return Prediction(id=pid, question_id=question_id, probability=prob, rationale=runs[0].rationale, evidence_ids=evidence_ids, model_runs={"deepseek-chat": sample_probs}, report_md=report)
+    return Prediction(id=pid, question_id=question_id, probability=prob, rationale=runs[0].rationale, evidence_ids=evidence_ids, model_runs={"deepseek-v4-flash": sample_probs}, report_md=report)

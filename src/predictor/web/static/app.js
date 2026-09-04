@@ -25,6 +25,7 @@ function mountThemeToggle() {
   paint();
   box.prepend(b);
 }
+function setTitle(t) { var el = document.querySelector("#page-title"); if (el) el.textContent = t; }
 const $ = (sel) => document.querySelector(sel);
 const mode = new URLSearchParams(location.search).get("mode");
 
@@ -80,11 +81,11 @@ async function renderBoard() {
   const avgBrier = briers.length ? (briers.reduce((a, b) => a + b, 0) / briers.length).toFixed(4) : "—";
   const pending = items.length - resolved.length;
   $("#app").innerHTML = `
-    <div class="card stat-strip">
-      <div class="stat"><span class="stat-label">题目总数</span><span class="stat-value">${items.length}</span></div>
-      <div class="stat"><span class="stat-label">已揭晓</span><span class="stat-value ok">${resolved.length}</span></div>
-      <div class="stat"><span class="stat-label">平均 Brier</span><span class="stat-value">${avgBrier}</span></div>
-      <div class="stat"><span class="stat-label">未揭晓</span><span class="stat-value warn">${pending}</span></div>
+    <div class="stat-grid">
+      <div class="card stat"><span class="stat-label">题目总数</span><span class="stat-value">${items.length}</span></div>
+      <div class="card stat"><span class="stat-label">已揭晓</span><span class="stat-value ok">${resolved.length}</span></div>
+      <div class="card stat"><span class="stat-label">平均 Brier</span><span class="stat-value">${avgBrier}</span></div>
+      <div class="card stat"><span class="stat-label">未揭晓</span><span class="stat-value warn">${pending}</span></div>
     </div>
     <div class="card filters">
       <select id="f-class" aria-label="按分类筛选">
@@ -317,11 +318,12 @@ async function renderPublic() {
   document.querySelectorAll(".tab").forEach((t) => (t.style.display = "none"));
   $("#mode-switch").innerHTML = `<a href="?"><button>← 内部视图</button></a>`;
   mountThemeToggle();
+  setTitle("战绩榜");
   $("#app").innerHTML = `
-    <div class="card stat-strip">
-      <div class="stat"><span class="stat-label">已揭晓</span><span class="stat-value">${s.resolved}</span></div>
-      <div class="stat"><span class="stat-label">整体 Brier</span><span class="stat-value">${s.brier_mean == null ? "—" : s.brier_mean.toFixed(4)}</span></div>
-      <div class="stat"><span class="stat-label">战绩窗口</span><span class="stat-value small">${s.first_resolved_at ? fmt(s.first_resolved_at) + " → " + fmt(s.last_resolved_at) : "—"}</span></div>
+    <div class="stat-grid">
+      <div class="card stat"><span class="stat-label">已揭晓</span><span class="stat-value">${s.resolved}</span></div>
+      <div class="card stat"><span class="stat-label">整体 Brier</span><span class="stat-value">${s.brier_mean == null ? "—" : s.brier_mean.toFixed(4)}</span></div>
+      <div class="card stat"><span class="stat-label">战绩窗口</span><span class="stat-value small">${s.first_resolved_at ? fmt(s.first_resolved_at) + " → " + fmt(s.last_resolved_at) : "—"}</span></div>
     </div>
     <div class="card"><h3>分桶 Brier</h3>${bucketsHTML(s.buckets)}</div>
     <div class="card"><h3>已揭晓预测</h3>
@@ -352,6 +354,7 @@ async function init() {
   else {
     $("#mode-switch").innerHTML = `<a href="?mode=public"><button>对外视图 →</button></a>`;
     mountThemeToggle();
+    setTitle("看板");
     document.querySelectorAll(".tab").forEach((t) =>
       t.addEventListener("click", async () => {
         document.querySelectorAll(".tab").forEach((x) => {
@@ -361,6 +364,7 @@ async function init() {
         t.classList.add("active");
         t.setAttribute("aria-selected", "true");
         state.tab = t.dataset.tab;
+        setTitle({ board: "看板", system: "系统", ops: "系统日志" }[state.tab] || "看板");
         stopOpsPolling();   // 切走必须停轮询：否则 30s 后 renderOps 会覆盖其他 tab 的 DOM
         if (state.tab === "board") await renderBoard();
         else if (state.tab === "system") await renderSystem();

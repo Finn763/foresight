@@ -23,6 +23,25 @@ from predictor.data.storage import Storage
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+def _parse_usage_lines(lines) -> list[dict]:
+    """解析 daily.log 的 [usage] 行 → [{day, prompt, completion, calls}]，坏行跳过，只留近 30 天。"""
+    days = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) != 5 or parts[0] != "[usage]":
+            continue
+        try:
+            days.append({
+                "day": parts[1],
+                "prompt": int(parts[2].split("=", 1)[1]),
+                "completion": int(parts[3].split("=", 1)[1]),
+                "calls": int(parts[4].split("=", 1)[1]),
+            })
+        except (IndexError, ValueError):
+            continue
+    return days[-30:]
+
+
 def _latest_unack_alert(alerts_dir: Path) -> dict | None:
     """最新未确认告警（评审 §3.5 告警消费）：文件名时间序取最后一条，跳过 .ack.md。
     解析标题/检出时间/告警要点；error 类文件（无「## 告警」小节）取检出时间后的
@@ -215,6 +234,16 @@ def _register_internal(app: FastAPI, db_dep) -> None:
         except OSError:
             return JSONResponse(status_code=404, content={"detail": "log file not found"})
         return {"name": name, "lines": list(deque(text.splitlines(), maxlen=100))}
+
+    @app.get("/api/ops/usage")
+    def ops_usage():
+        """Token 用量板块数据源：解析 data/daily.log 的 [usage] 行。文件缺失返回空数组。"""
+        log_path = Path(app.state.db_path).parent / "daily.log"
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return {"days": []}
+        return {"days": _parse_usage_lines(text.splitlines())}
 
     @app.get("/api/ops/alerts")
     def ops_alerts():

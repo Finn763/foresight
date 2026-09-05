@@ -201,6 +201,7 @@ async function renderOps() {
   const typeParam = state.opsFilter ? "&types=" + encodeURIComponent(CHIP_TYPES[state.opsFilter]) : "";
   const h = await fetchJSON("/api/ops/health");
   const { items } = await fetchJSON("/api/ops/log?limit=200" + typeParam);
+  const u = await fetchJSON("/api/ops/usage");
   $("#app").innerHTML = `
     <div class="card health-banner ${h.status}">
       <span class="health-dot" aria-hidden="true"></span>
@@ -219,6 +220,7 @@ async function renderOps() {
             `<details><summary>明细</summary><pre>${esc(JSON.stringify(c.detail, null, 2))}</pre></details>` : ""}
         </div>`).join("")}
     </div>
+    <div class="card"><h3>Token 用量（近 30 天）</h3>${usageHTML(u.days)}</div>
     <div class="card"><h3>事件时间线（最近 200 条）</h3>
       <div class="chips">${chipsHTML()}</div>
       <ul class="timeline">${items.map(evHTML).join("") || "<li class='empty narrow'>暂无事件</li>"}</ul>
@@ -240,11 +242,21 @@ async function renderOps() {
     let tries = 0;
     clearInterval(probeTimer);
     probeTimer = setInterval(async () => {
-      const now = await fetchJSON("/api/ops/health");
+      let now;
+      try {
+        now = await fetchJSON(`/api/ops/health`);
+      } catch {
+        clearInterval(probeTimer);   // health 瞬间失败也要复位按钮，不卡「检测中…」
+        renderOps();
+        return;
+      }
       if (state.tab !== "ops") { clearInterval(probeTimer); return; }   // 切走即弃，不覆盖其他 tab
       if (!now.checks.some((c) => c.key === "probe_refreshing") || ++tries > 10) {
         clearInterval(probeTimer);
-        renderOps();
+        renderOps().then(() => {
+          const b = document.querySelector("#refresh-probes");   // 明确回执：结果不变时也能看见刷新发生过
+          if (b) { b.textContent = "已刷新 ✓"; setTimeout(() => { if (b.isConnected) b.textContent = "立即检测"; }, 3000); }
+        });
       }
     }, 3000);
   };
@@ -310,6 +322,16 @@ function modelStatsHTML(stats) {
       <td class="mono">${m.brier_ema == null ? "—" : m.brier_ema.toFixed(4)}</td><td class="nowrap mono">${fmt(m.last_updated)}</td></tr>`).join("")}</tbody></table>`;
 }
 function emptyHTML(title, sub) { return `<div class="empty"><strong>${title}</strong>${sub}</div>`; }
+function usageHTML(days) {
+  if (!days.length) return emptyHTML("暂无用量数据", "首行将于本轮结束（daily.py）写入 daily.log");
+  const t = days.reduce((a, d) => ({ prompt: a.prompt + d.prompt, completion: a.completion + d.completion, calls: a.calls + d.calls }),
+    { prompt: 0, completion: 0, calls: 0 });
+  return `<table><thead><tr><th>日期</th><th>Prompt</th><th>Completion</th><th>调用</th></tr></thead>
+    <tbody>${days.map((d) => `<tr><td class="nowrap mono">${esc(d.day)}</td><td class="mono">${d.prompt}</td>
+      <td class="mono">${d.completion}</td><td class="mono">${d.calls}</td></tr>`).join("")}
+      <tr><td class="mono"><strong>合计</strong></td><td class="mono"><strong>${t.prompt}</strong></td>
+      <td class="mono"><strong>${t.completion}</strong></td><td class="mono"><strong>${t.calls}</strong></td></tr></tbody></table>`;
+}
 
 // ---- 对外视图（战绩榜）：仅从 /api/public/* 取数 ----
 async function renderPublic() {

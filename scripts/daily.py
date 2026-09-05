@@ -24,7 +24,7 @@ from predictor.data.newsapi_source import NewsAPISource
 from predictor.data.storage import Storage
 from predictor.resolution.spec import validate_resolution_spec
 from predictor.selection.families import generate_families
-from predictor.llm.client import LLMClient
+from predictor.llm.client import LLMClient, dump_daily_usage
 from predictor.ops.lock import acquire_lock
 from predictor.ops.manual import manual_candidates
 from predictor.websearch_predictor import predict_with_websearch
@@ -155,6 +155,7 @@ def _run(args, settings: Settings) -> None:
         flag = " (样本不足)" if b["unreliable"] else ""
         print(f"  {b['bucket']}: n={b['n']} Brier={b['brier_mean']:.4f}{flag}")
     _log_event(st, "round_completed", json.dumps({"round": "daily_predict", "stats": {"predicted": predicted, "skipped": skipped, "families_added": len(added_ids)}}))
+    dump_daily_usage(Path("data") / "daily.log")
     print("daily completed", flush=True)
 
 def main() -> None:

@@ -86,6 +86,13 @@ python scripts/autopick.py --dry-run         # full pipeline, no files written
 python scripts/autopick.py                   # run for real (idempotent per day)
 ```
 
+TruthSet (frozen resolved questions + leak-controlled replay of the classic pipeline):
+
+```bash
+python scripts/truthset_build.py             # snapshot resolved questions → data/truthset/v1.jsonl
+python scripts/truthset_replay.py --limit 3  # replay from pred_date=closes-30d, prints one-line Brier JSON
+```
+
 ### 2. foresight agent (interactive shell)
 
 ```bash

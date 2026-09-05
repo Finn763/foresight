@@ -219,6 +219,46 @@ def collect(st, now: datetime, *, lock_state: str | None = None) -> list[str]:
     return alerts, report
 
 
+def _prediction_gap_assertion(db_path: str, now: datetime) -> list[str]:
+    """业务断言：当日 predictions 零新增，但仍存在应预测题 → 落一条告警。
+
+    应预测口径照抄 evolve.predict_round 候选逻辑：未揭晓（outcome IS NULL）且
+    closes_at > now（未到期）且距上次预测已满 7×24h（或从未预测）。
+    读走独立 read_only 连接（wait_acquire 持锁内），零写；读失败静默跳过，
+    整体健康仍由既有 checks / 24h 事件规则覆盖。
+    """
+    from predictor.data.storage import Storage
+
+    try:
+        st = Storage(db_path, read_only=True)
+        try:
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            row = st._conn.execute(
+                "SELECT COUNT(*) FROM predictions WHERE created_at >= ? AND created_at < ?",
+                [start, start + timedelta(days=1)],
+            ).fetchone()
+            if row and int(row[0]) > 0:
+                return []
+            due = 0
+            for q in st.list_unresolved():
+                if q.closes_at <= now:
+                    continue
+                last = st.last_prediction_at(q.id)
+                if last is not None and (now - last) < timedelta(hours=168):
+                    continue
+                due += 1
+            if due:
+                return [
+                    f"今日 predictions 新增 0 行，应预测 {due} 题"
+                    "（未到期且距上次预测 ≥ 7 天）"
+                ]
+            return []
+        finally:
+            st.close()
+    except Exception:
+        return []
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=None, help="DB 路径，默认 Settings().db_path")
@@ -261,6 +301,8 @@ def main(argv=None) -> int:
             st.create_schema()
             now = datetime.fromisoformat(args.now) if args.now else datetime.now()
             alerts, report = collect(st, now, lock_state="none")
+            st.close()  # 释放 rw 连接，业务断言改走 read_only（同进程 rw+ro 并存会被 DuckDB 拒绝）
+            alerts += _prediction_gap_assertion(db_path, now)
     except LockWaitTimeout as e:
         # 兜底告警：排队超时也必须有可见产物——监控不能在被监控对象持锁时失明
         # （实测 daily 轮持锁超过巡检等锁上限，评审 §3.1）。

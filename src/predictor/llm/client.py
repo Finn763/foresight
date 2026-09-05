@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import threading
+from datetime import date
 from typing import Any
 
 import httpx
@@ -10,6 +12,51 @@ import httpx
 # （8-14 实测 reasoning_tokens=1315-2458 对 ~200 token 的最终答案），逐次翻倍
 # 到 16384 仍可能被长推理吃光（qid 68 实测失败）；显式截断信号出现时直接跳到上限。
 _MAX_OUTPUT_TOKENS_CEILING = 65536
+
+# 进程内 token 记账：按天累积 prompt/completion tokens 与调用次数。
+# usage 取不到时记 0 并计入 unknown（不阻断调用，仅记账）。
+_DAILY_USAGE_LOCK = threading.Lock()
+_DAILY_USAGE: dict[str, dict[str, int]] = {}
+
+
+def _record_usage(data) -> None:
+    usage = data.get("usage") if isinstance(data, dict) else None
+    prompt = 0
+    completion = 0
+    unknown = 0
+    if isinstance(usage, dict):
+        p = usage.get("prompt_tokens")
+        if p is None:
+            p = usage.get("input_tokens")
+        c = usage.get("completion_tokens")
+        if c is None:
+            c = usage.get("output_tokens")
+        if isinstance(p, int) and isinstance(c, int):
+            prompt = p
+            completion = c
+        else:
+            unknown = 1
+    else:
+        unknown = 1
+    day = date.today().isoformat()
+    with _DAILY_USAGE_LOCK:
+        rec = _DAILY_USAGE.setdefault(
+            day, {"prompt": 0, "completion": 0, "calls": 0, "unknown": 0}
+        )
+        rec["prompt"] += prompt
+        rec["completion"] += completion
+        rec["calls"] += 1
+        rec["unknown"] += unknown
+
+
+def dump_daily_usage(log_path) -> None:
+    """把当日汇总（日期/总 prompt/总 completion/调用次数）追加一行到 log_path。"""
+    day = date.today().isoformat()
+    with _DAILY_USAGE_LOCK:
+        rec = _DAILY_USAGE.get(day, {"prompt": 0, "completion": 0, "calls": 0})
+        prompt, completion, calls = rec["prompt"], rec["completion"], rec["calls"]
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[usage]\t{day}\tprompt={prompt}\tcompletion={completion}\tcalls={calls}\n")
 
 
 class LLMError(Exception):
@@ -48,6 +95,7 @@ async def _post_with_retry(client, url, payload, headers, max_retries, check):
                     await asyncio.sleep(2**attempt)
                     continue
                 break
+            _record_usage(data)
             return data
         except (httpx.HTTPError, KeyError, ValueError) as e:
             last_err = e

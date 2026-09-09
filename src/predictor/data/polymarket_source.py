@@ -66,34 +66,53 @@ def _is_closed_false(m: dict) -> bool:
     return not bool(closed)
 
 
-def fetch_events(client: httpx.Client, *, limit: int = 50, offset: int = 0) -> list[dict]:
-    """活跃事件列表（按结束时间升序，最近的先出）。非 2xx 抛 httpx 异常，调用方降级。"""
-    r = client.get(
-        f"{GAMMA_BASE}/events",
-        params={
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": offset,
-            "order": "endDate",
-            "ascending": "true",
-        },
-        timeout=30.0,
-    )
+# 体育/电竞/娱乐类市场标题硬过滤（与 autopick 的天气硬过滤同款纪律）：
+# 短期赛事市场成交量碾压真事件题，不拦会占满 short 档且 B 端价值低
+EXCLUDE_TITLE_KEYWORDS = (
+    # 电竞
+    "counter-strike", "cs2", "cs:go", "dota", "league of legends", "lol:", "valorant",
+    "esports", "game 1 winner", "map 1 winner", "(bo3)", "(bo5)",
+    # 体育赛事（对阵/联赛/每日赛果）
+    " vs. ", " vs ", "spread:", "win on 20", "t20", "nfl", "nba", "mlb", "nhl",
+    "premier league", "la liga", "serie a", "bundesliga", "ligue 1", "uefa",
+    "champions league", "world cup", "super bowl", "world series", "stanley cup",
+    "playoffs", "grand slam", "wimbledon", "men's us open", "women's us open",
+    "atp ", "wta ", "formula 1", "f1 ", "ufc", "boxing", "olympic",
+)
+
+# /markets 分页 offset 上限（实测 offset=2100 起 422）：按成交量降序取头部足够选材
+MAX_MARKET_OFFSET = 2000
+
+
+def fetch_markets(
+    client: httpx.Client,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    end_date_min: datetime | None = None,
+    end_date_max: datetime | None = None,
+) -> list[dict]:
+    """活跃市场候选池（服务端按结束窗口过滤 + 成交量降序）。非 2xx 抛 httpx 异常，调用方降级。
+
+    旧路径 `/events?order=endDate&ascending=true` 实测只会扫到 2025-11 起的**过期**事件
+    （窗口内事件在 offset 2100 之外且翻页 422），导致 pm_fetch 连续多轮 0 候选——已废弃。
+    """
+    params: dict[str, Any] = {
+        "closed": "false",
+        "active": "true",
+        "limit": limit,
+        "offset": offset,
+        "order": "volumeNum",
+        "ascending": "false",
+    }
+    if end_date_min is not None:
+        params["end_date_min"] = end_date_min.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if end_date_max is not None:
+        params["end_date_max"] = end_date_max.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = client.get(f"{GAMMA_BASE}/markets", params=params, timeout=30.0)
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, list) else []
-
-
-def fetch_event_markets(client: httpx.Client, event_id: str) -> list[dict]:
-    """单个事件的 markets（内嵌 question/outcomePrices/volume/endDate）。"""
-    r = client.get(f"{GAMMA_BASE}/events/{event_id}", timeout=30.0)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, dict):
-        return []
-    markets = data.get("markets")
-    return markets if isinstance(markets, list) else []
 
 
 def select_candidates(
@@ -110,6 +129,9 @@ def select_candidates(
     picked: dict[str, list[dict]] = {name: [] for _, _, name in tiers}
     for m in markets:
         if not _is_closed_false(m):
+            continue
+        title_l = str(m.get("question") or "").lower()
+        if any(kw in title_l for kw in EXCLUDE_TITLE_KEYWORDS):
             continue
         # 只取二值市场（outcomes 恰 2 个）：多选市场（'Who will win...'）二值预测无意义
         raw_outcomes = m.get("outcomes")
@@ -141,6 +163,16 @@ def select_candidates(
             continue
         picked[tier_name].append(m)
     out: list[PMCandidate] = []
+    # 同事件多市场（F1 冠军 20 个车手、Fed 决议 5 个档位）只留成交量最大的一个：
+    # 同事件题高度相关，全入池会互相挤占 per_tier 名额、污染 Brier
+    event_best: dict[str, dict] = {}
+    for m in (mm for row in picked.values() for mm in row):
+        eid = str((m.get("events") or [{}])[0].get("id") or m.get("_event_id") or m.get("id") or "")
+        if float(m.get("volume") or 0.0) > float(event_best.get(eid, {}).get("volume") or -1.0):
+            event_best[eid] = m
+    keep_ids = {id(m) for m in event_best.values()}
+    for name in picked:
+        picked[name] = [m for m in picked[name] if id(m) in keep_ids]
     # 全局去重（跨档）：归一化题面（只通配日期语境数字）相同只保留最早结束的——
     # 防 "GPT-6 by Aug 21"（短档）与 "GPT-6 by Aug 31"（中档）这类跨档同主题题互相污染 Brier
     dedup_global: dict[str, dict] = {}

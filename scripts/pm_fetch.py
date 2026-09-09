@@ -1,11 +1,11 @@
 """python scripts/pm_fetch.py --dry-run
-从 Polymarket Gamma API 拉活跃市场 → horizon 三档筛选 → LLM 译中文 → 入题池。
+从 Polymarket Gamma API 拉活跃市场（/markets 服务端窗口过滤 + 成交量降序）→
+horizon 三档筛选 → LLM 译中文 → 入题池。
 
 用法：
   python scripts/pm_fetch.py                     # 拉取并入库（分档：短≤14/中≤45/长≤90 天）
   python scripts/pm_fetch.py --dry-run           # 只打印候选，不落库不翻译
-  python scripts/pm_fetch.py --per-tier 8 --min-volume 10000
-  python scripts/pm_fetch.py --max-events 300    # 分页扫描事件数上限（保护）
+  python scripts/pm_fetch.py --per-tier 8 --min-volume 5000
 
 题面：英文原题 LLM 译中文（失败回退英文）；closes_at = 市场 endDate（北京时间）；
 resolution_spec 记 polymarket 来源（market_id 判重 + pm_resolve 揭晓溯源）。
@@ -14,7 +14,6 @@ resolution_spec 记 polymarket 来源（market_id 判重 + pm_resolve 揭晓溯�
 
 import argparse
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -25,9 +24,8 @@ import httpx
 
 from predictor.config import Settings
 from predictor.data.polymarket_source import (
-    _parse_utc,
-    fetch_event_markets,
-    fetch_events,
+    MAX_MARKET_OFFSET,
+    fetch_markets,
     select_candidates,
     translate_title,
 )
@@ -38,8 +36,7 @@ from predictor.llm.client import LLMClient
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=Settings().db_path)
-    ap.add_argument("--max-events", type=int, default=500, help="分页扫描事件数上限（保护）")
-    ap.add_argument("--per-tier", type=int, default=6, help="每档（短/中/长）最多入库题数")
+    ap.add_argument("--per-tier", type=int, default=8, help="每档（短/中/长）最多入库题数")
     ap.add_argument("--min-volume", type=float, default=1000.0, help="市场累计成交额门槛（美元）")
     ap.add_argument("--dry-run", action="store_true", help="只打印候选，不翻译不落库")
     ap.add_argument("--public", action="store_true", help="入库为公开题（默认内部题）")
@@ -64,56 +61,31 @@ def main() -> int:
         print(f"DB 初始化失败（可能被其他轮持锁，下一轮自动重试）：{e}")
         return 1
 
-    horizon_end = datetime.now(UTC) + timedelta(days=90)  # 只扫长档窗口内的事件
+    now = datetime.now(UTC)
+    horizon_end = now + timedelta(days=90)
     with httpx.Client() as http:
         try:
-            events: list[dict] = []
+            markets: list[dict] = []
             offset = 0
-            while offset < args.max_events:
-                page = fetch_events(http, limit=100, offset=offset)
+            # 服务端已按 end_date 窗口过滤并按成交量降序；本地只需翻页
+            # （offset 超上限 API 直接 422，MAX_MARKET_OFFSET 即实测安全边界）
+            while offset <= MAX_MARKET_OFFSET:
+                page = fetch_markets(
+                    http, limit=100, offset=offset, end_date_min=now, end_date_max=horizon_end
+                )
                 if not page:
                     break
-                events.extend(page)
-                # 升序 = 最早结束在前：本页最早事件的 endDate 已超 90 天窗口则停
-                earliest = min(
-                    (_parse_utc(e.get("endDate")) for e in page if e.get("endDate")),
-                    default=None,
-                )
-                if earliest is None or earliest > horizon_end:
-                    break
+                markets.extend(page)
                 offset += 100
-            if offset >= args.max_events:
-                print(
-                    f"警告：事件扫描达上限 {args.max_events}，90 天窗口可能未扫完（长档候选不完整），"
-                    f"建议提高 --max-events"
-                )
         except Exception as e:
             # 网络失败整轮终止：可读消息 + exit 1（LastTaskResult 非零可查），
             # 不裸 traceback；幂等语义不受影响（本轮未入库任何题）。
-            print(f"事件列表拉取失败（网络降级，本轮终止）：{e}")
+            print(f"市场列表拉取失败（网络降级，本轮终止）：{e}")
             return 1
-        # 并发拉各事件的 markets（8 线程；单事件失败跳过，不阻塞整轮）
-        markets: list[dict] = []
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            futs = {
-                ex.submit(fetch_event_markets, http, str(ev.get("id") or "")): str(
-                    ev.get("id") or ""
-                )
-                for ev in events
-                if ev.get("id")
-            }
-            for fut in as_completed(futs):
-                eid = futs[fut]
-                try:
-                    for m in fut.result():
-                        m["_event_id"] = eid  # 供同主题去重
-                        markets.append(m)
-                except Exception:
-                    continue  # 单事件失败跳过，不阻塞整轮
-    print(f"事件 {len(events)} 个 → 市场 {len(markets)} 个")
+    print(f"市场 {len(markets)} 个（0-90 天窗口，成交量降序）")
 
     candidates = select_candidates(
-        markets, now=datetime.now(UTC), per_tier=args.per_tier, min_volume=args.min_volume
+        markets, now=now, per_tier=args.per_tier, min_volume=args.min_volume
     )
     fresh = [c for c in candidates if c.market_id not in known]
     print(f"候选 {len(candidates)}（去重后新增 {len(fresh)}）")

@@ -57,7 +57,7 @@ EXPECTED_CHANNELS = {
     "pm_fetch": (
         "write",
         "script",
-        [("dry_run", False), ("public", False), ("max_events", False), ("per_tier", False), ("min_volume", False), ("no_translate", False)],
+        [("dry_run", False), ("public", False), ("per_tier", False), ("min_volume", False), ("no_translate", False)],
         900_000,
         None,
     ),

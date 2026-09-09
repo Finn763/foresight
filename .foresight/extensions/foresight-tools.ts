@@ -451,7 +451,6 @@ const BRIDGE_CONTRACT: BridgeContract = {
       params: [
         { name: "dry_run", required: false },
         { name: "public", required: false },
-        { name: "max_events", required: false },
         { name: "per_tier", required: false },
         { name: "min_volume", required: false },
         { name: "no_translate", required: false },
@@ -1257,8 +1256,7 @@ export default function (pi: ExtensionAPI) {
       parameters: Type.Object({
         dry_run: Type.Optional(Type.Boolean({ default: true })),
         public: Type.Optional(Type.Boolean({ description: "入库为公开题（默认内部题）" })),
-        max_events: Type.Optional(Type.Integer({ minimum: 50, maximum: 1000, default: 300 })),
-        per_tier: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, default: 6 })),
+        per_tier: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, default: 8 })),
         min_volume: Type.Optional(Type.Number({ minimum: 0, default: 1000 })),
         no_translate: Type.Optional(Type.Boolean()),
       }),
@@ -1266,10 +1264,8 @@ export default function (pi: ExtensionAPI) {
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const args = [
           "scripts/pm_fetch.py",
-          "--max-events",
-          String(params.max_events ?? 300),
           "--per-tier",
-          String(params.per_tier ?? 6),
+          String(params.per_tier ?? 3),
           "--min-volume",
           String(params.min_volume ?? 1000),
         ];

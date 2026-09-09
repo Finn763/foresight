@@ -107,6 +107,43 @@ def test_probe_scheduler_verbose_csv_real_header(monkeypatch):
     assert "Foresight-Resolve" in out["detail"] or "foresight-resolve" in out["detail"]
 
 
+def test_probe_scheduler_covers_all_12_tasks(monkeypatch):
+    """探针必须覆盖实机 12 个任务（前缀含 Health-PM/AutoPickIngest），而非旧的 3 个。"""
+    import subprocess
+
+    names = [
+        "foresight-daily", "Foresight-Predict", "Foresight-Resolve", "Foresight-Health",
+        "Foresight-Health-PM", "foresight-signsrv", "Foresight-AutoPick",
+        "Foresight-AutoPickIngest", "Foresight-AgentDaily", "Foresight-PMFetch",
+        "Foresight-PMResolve", "Foresight-Backup", "Foresight-Dashboard",
+    ]
+    rows = ['"任务名","状态","上次运行时间","上次结果"']
+    rows += [f'"\\\\{n}","就绪","2026/8/13 9:00:00","0"' for n in names]
+
+    class FakeDone:
+        stdout = ("\n".join(rows)).encode("gbk")
+        stderr = b""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeDone())
+    out = probes._probe_scheduler()
+    assert out["ok"] is True and out["detail"] == "13 个任务正常"
+
+
+def test_probe_scheduler_no_match_is_not_ok(monkeypatch):
+    """任务名全不匹配 → 不能误报正常（防 schtasks 输出漂移后静默全绿）。"""
+    import subprocess
+
+    class FakeDone:
+        stdout = (
+            '"任务名","状态","上次运行时间","上次结果"\n"\\OtherTask","就绪","N/A","0"\n'
+        ).encode("gbk")
+        stderr = b""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeDone())
+    out = probes._probe_scheduler()
+    assert out["ok"] is False
+
+
 def test_cache_ttl_and_refresh_idempotent(monkeypatch):
     _reset()
     probes._cache.update({"quotes": {"ok": True, "detail": ""}, "ts": time.time()})

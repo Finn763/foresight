@@ -167,5 +167,5 @@ def test_cli_same_day_alert_merged(tmp_path):
     assert r1.returncode == 1 and r2.returncode == 1
     alerts = list((d / "alerts").glob("*.md"))
     assert len(alerts) == 1, alerts
-    assert "LLM 揭晓失败" in alerts[0].read_text(encoding="utf-8")
+    assert "LLM 揭晓调用失败" in alerts[0].read_text(encoding="utf-8")
     assert "已合并" in r2.stdout.decode("utf-8", errors="ignore")

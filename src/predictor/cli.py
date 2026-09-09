@@ -150,6 +150,44 @@ def predict_once(
     }
 
 
+def predict_existing(qid: int, engine: str, st: Storage, settings: Settings) -> dict[str, Any]:
+    """对已存在的未揭晓题重新预测（agent `predict --qid` 通道）。
+
+    与 daily/evolve 同入口：websearch 引擎走 `predict_with_websearch`
+    （自取 baseline/历史上下文，落一条新 prediction），不建题、不改题。
+    """
+    try:
+        q = st.get_question(qid)
+    except KeyError:
+        return {"ok": False, "question_id": qid, "reason": f"题目不存在: {qid}"}
+    now = datetime.now()
+    if q.outcome is not None:
+        return {"ok": False, "question_id": qid, "reason": "已揭晓，不再预测"}
+    if q.closes_at <= now:
+        return {"ok": False, "question_id": qid, "reason": "已到期，交揭晓轮处理"}
+    client = LLMClient(**settings.llm_client_kwargs)
+    try:
+        if engine == "websearch":
+            from predictor.websearch_predictor import predict_with_websearch
+
+            pred = predict_with_websearch(qid, st, client, now)
+        else:
+            pred = run_prediction(qid, st, client, build_sources(), now=now)
+    except Exception as e:  # noqa: BLE001 —— CLI 边界：任何失败都输出可解析 JSON
+        return {"ok": False, "question_id": qid, "reason": f"管线失败: {e}"}
+    if pred is None:
+        return {"ok": False, "question_id": qid, "reason": "无可用证据或管线失败"}
+    return {
+        "ok": True,
+        "question_id": qid,
+        "is_public": q.is_public,
+        "probability": pred.probability,
+        "rationale": pred.rationale,
+        "report_md": pred.report_md,
+        "evidence_ids": pred.evidence_ids,
+    }
+
+
 def publish_question(qid: int, st: Storage) -> dict[str, Any]:
     """草稿题转公开（审核门）。"""
     # 注意：duckdb 的 UPDATE rowcount 恒为 -1，不能用它判断是否命中 → UPDATE 后 SELECT 验证
@@ -193,6 +231,12 @@ def main() -> None:
         "classic=Halawi 自建检索管线（回测/历史题专用，防泄漏）",
     )
     ap.add_argument("--db", default=None, help="DB 路径，默认 Settings().db_path")
+    ap.add_argument(
+        "--qid",
+        type=int,
+        default=None,
+        help="对已存在的未揭晓题重新预测（与标题二选一；agent 存量轮用）",
+    )
     args = ap.parse_args()
 
     _load_project_env()
@@ -213,8 +257,12 @@ def main() -> None:
         print(json.dumps(publish_question(args.publish, st), ensure_ascii=False))
         return
 
+    if args.qid is not None:
+        print(json.dumps(predict_existing(args.qid, args.engine, st, settings), ensure_ascii=False))
+        return
+
     if not args.title:
-        ap.error("需要提供预测问题文本，或用 --publish <id> 转公开")
+        ap.error("需要提供预测问题文本，或用 --publish <id> / --qid <id>")
 
     title = " ".join(args.title)
     closes = (

@@ -44,8 +44,11 @@ foresight/
 
 ```bash
 npm i -g foresight-agent
-foresight "Will the Fed cut rates in September?" --closes 2026-09-17
+foresight-engine "Will the Fed cut rates in September?" --closes 2026-09-17
 ```
+
+> The npm package ships the **Python engine CLI** under the command `foresight-engine`.
+> The interactive agent shell (pi fork) is a separate install — see §2 below — and owns the bare `foresight` command.
 
 The npm installer fetches a prebuilt, self-contained binary for your platform (Windows x64, macOS x64/arm64, Linux x64) — the Python runtime and all dependencies are bundled inside, so no Python, uv, or package manager setup is required. To use your own API key, copy `.env.example` to `.env` and set `DEEPSEEK_API_KEY`, or set it as an environment variable.
 
@@ -103,7 +106,7 @@ cd packages/coding-agent && npm link    # global `foresight` command
 
 Start `foresight` from the project root; its config directory is `.foresight/` (guardrails `SYSTEM.md`, tool extension `extensions/foresight-tools.ts`). The extension exposes `questions` / `leaderboard` / `predict` / `resolve` tools as thin wrappers around the Python engine (venv python + `-E -X utf8`; see the header comment in the extension file).
 
-Fork note: `shell/pi` is based on [earendil-works/pi](https://github.com/earendil-works/pi) (MIT License © Mario Zechner) v0.84.1, modified in three places in `package.json` (name/bin/piConfig) plus one extension-loader change (`fsCache:false`). See `shell/BRANDING.md`.
+Fork note: `shell/pi` is based on [earendil-works/pi](https://github.com/earendil-works/pi) (MIT License © Mario Zechner) v0.84.4, modified in three places in `package.json` (name/bin/piConfig) plus one extension-loader change (`fsCache:false`). See `shell/BRANDING.md`.
 
 ## Docs
 

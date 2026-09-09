@@ -114,8 +114,8 @@ def test_probe_scheduler_covers_all_12_tasks(monkeypatch):
     names = [
         "foresight-daily", "Foresight-Predict", "Foresight-Resolve", "Foresight-Health",
         "Foresight-Health-PM", "foresight-signsrv", "Foresight-AutoPick",
-        "Foresight-AutoPickIngest", "Foresight-PMFetch", "Foresight-PMResolve",
-        "Foresight-Backup", "Foresight-Dashboard",
+        "Foresight-AutoPickIngest", "Foresight-AgentDaily", "Foresight-PMFetch",
+        "Foresight-PMResolve", "Foresight-Backup", "Foresight-Dashboard",
     ]
     rows = ['"任务名","状态","上次运行时间","上次结果"']
     rows += [f'"\\\\{n}","就绪","2026/8/13 9:00:00","0"' for n in names]
@@ -126,7 +126,7 @@ def test_probe_scheduler_covers_all_12_tasks(monkeypatch):
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeDone())
     out = probes._probe_scheduler()
-    assert out["ok"] is True and out["detail"] == "12 个任务正常"
+    assert out["ok"] is True and out["detail"] == "13 个任务正常"
 
 
 def test_probe_scheduler_no_match_is_not_ok(monkeypatch):

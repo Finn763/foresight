@@ -28,7 +28,9 @@
 | 4 | 跨天记忆 | 每天冷启动，`data/daily-brief.md` 只落盘不回灌 | agent 不知道昨天选了什么 | `before_agent_start` hook 注入昨日简报+池子摘要 |
 | 5 | 健康告警 | 红条只进 dashboard | agent 不知道要修什么 | 每日轮开头读 health |
 | 6 | 对外口径 | README/架构图写"选题引擎=autopick.py"；CLI banner 自称 "AI coding assistant" | 对外不是 agent 形象 | 改 README 定位 + fork branding 残留 |
-| 7 | 上游同步 | `shell/pi` 无 git remote，手工拷 | 维护隐患 | 阶段 2：clone 上游 + rebrand 三处补丁化 |
+
+> 第 7 项「上游同步（shell/pi 无 git remote）」经 CC 复核**已失效删除**：`shell/pi` 早有 origin+upstream(no_push)，2026-09-04 已 rebase 到 v0.84.4。
+> 复核结论见 `docs/cc-agent-first-review-2026-09-09.md`（另指出第 1 项不该用 `--yolo`、第 6 项模型侧无问题、第 3 项引擎侧 YAGNI）。
 
 ## 三、你要交付什么
 

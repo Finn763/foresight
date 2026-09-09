@@ -316,7 +316,7 @@ interface BridgeContract {
     confirmGate: string;
     sequential: string;
   };
-  /** 通道清单（22 条 = 11 只读 + 11 写；第三条通道的 9 个 inline_json 已全部契约化） */
+  /** 通道清单（23 条 = 11 只读 + 12 写；第三条通道的 9 个 inline_json 已全部契约化） */
   channels: readonly BridgeChannelContract[];
 }
 
@@ -448,8 +448,9 @@ const BRIDGE_CONTRACT: BridgeContract = {
       backend: "script",
       entry: "scripts/predict_cli.py",
       params: [
-        { name: "question", required: true },
+        { name: "question", required: false },
         { name: "closes", required: false },
+        { name: "qid", required: false },
       ],
       timeoutMs: PREDICT_TOOL_TIMEOUT_MS,
     },
@@ -488,6 +489,17 @@ const BRIDGE_CONTRACT: BridgeContract = {
       entry: "scripts/schedule_questions.py",
       params: [{ name: "week", required: false }],
       timeoutMs: 300_000,
+    },
+    {
+      name: "autopick",
+      kind: "write",
+      backend: "script",
+      entry: "scripts/autopick.py",
+      params: [
+        { name: "dry_run", required: false },
+        { name: "max_picks", required: false },
+      ],
+      timeoutMs: 900_000,
     },
     {
       name: "pm_fetch",
@@ -1155,16 +1167,33 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "predict",
       label: "Predict",
-      description: "Foresight 预测引擎：对给定事件出概率+依据+报告（建草稿题，输出单行 JSON）",
+      description:
+        "Foresight 预测引擎：新建题出概率（question），或对已存在未揭晓题重新预测（qid）。输出单行 JSON。",
       parameters: Type.Object({
-        question: Type.String({ maxLength: 2000, description: "预测问题，如：美联储9月会加息吗" }),
+        question: Type.Optional(
+          Type.String({ maxLength: 2000, description: "预测问题文本（新建草稿题）；与 qid 二选一" }),
+        ),
         closes: Type.Optional(Type.String({ description: "揭晓日期 YYYY-MM-DD，缺省 30 天后" })),
+        qid: Type.Optional(
+          Type.Integer({ minimum: 1, description: "已存在未揭晓题的 id，重新预测该题；与 question 二选一" }),
+        ),
       }),
       executionMode: SEQUENTIAL,
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const args = [];
-        if (params.closes) args.push("--closes", params.closes);
-        args.push("--", params.question);
+        const args: string[] = [];
+        if (params.qid !== undefined) {
+          args.push("--qid", String(params.qid));
+        } else if (params.question) {
+          if (params.closes) args.push("--closes", params.closes);
+          args.push("--", params.question);
+        } else {
+          return {
+            content: [
+              { type: "text", text: "predict：需要 question（新建题）或 qid（存量题重预测）之一。" },
+            ],
+            details: {},
+          };
+        }
         const { stdout } = await runPython(
           pi,
           ctx.cwd,
@@ -1321,6 +1350,41 @@ export default function (pi: ExtensionAPI) {
   contractTool(
     pi,
     defineTool({
+      name: "autopick",
+      label: "Autopick",
+      description:
+        "自主选题引擎：扫新闻源 → LLM 初筛/出题 → 落盘候选题 JSON + 简报。dry_run=true（缺省）只跑流程不落盘；dry_run=false 才写文件并弹确认框（不直接写库，入库由 autopick_ingest 完成）。",
+      parameters: Type.Object({
+        dry_run: Type.Optional(Type.Boolean({ default: true })),
+        max_picks: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, default: 4 })),
+      }),
+      executionMode: SEQUENTIAL,
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const args = ["scripts/autopick.py", "--max-picks", String(params.max_picks ?? 4)];
+        const dry = params.dry_run !== false;
+        if (dry) {
+          args.push("--dry-run");
+          const { stdout } = await runPython(pi, ctx.cwd, args, channelTimeout("autopick"), signal);
+          return { content: [{ type: "text", text: clipText(stdout) }], details: {} };
+        }
+        const out = await runWriteScript(
+          pi,
+          ctx,
+          "autopick（落盘）",
+          "将执行 python scripts/autopick.py（非 dry-run）。副作用：写 data/autopick/*.json 与 " +
+            "data/daily-brief.md（不入库；入库需另跑 scripts/autopick_ingest.py）。",
+          args,
+          channelTimeout("autopick"),
+          signal,
+        );
+        return { content: [{ type: "text", text: out }], details: {} };
+      },
+    }),
+  );
+
+  contractTool(
+    pi,
+    defineTool({
       name: "pm_fetch",
       label: "PM Fetch",
       description:
@@ -1337,7 +1401,7 @@ export default function (pi: ExtensionAPI) {
         const args = [
           "scripts/pm_fetch.py",
           "--per-tier",
-          String(params.per_tier ?? 3),
+          String(params.per_tier ?? 8),
           "--min-volume",
           String(params.min_volume ?? 1000),
         ];

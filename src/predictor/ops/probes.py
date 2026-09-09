@@ -86,6 +86,7 @@ _TASKS = (
     "foresight-resolve",
     "foresight-health",
     "foresight-autopick",
+    "foresight-agentdaily",
     "foresight-pmfetch",
     "foresight-pmresolve",
     "foresight-backup",

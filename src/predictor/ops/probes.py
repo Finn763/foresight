@@ -79,7 +79,20 @@ def _probe_llm() -> dict:
         return {"ok": False, "detail": f"{type(e).__name__}: {str(e)[:120]}"}
 
 
-_TASKS = ("foresight-daily", "foresight-predict", "foresight-resolve")
+# 调度任务匹配前缀（覆盖实机 12 个任务：health 前缀含 Health-PM、autopick 前缀含 AutoPickIngest）
+_TASKS = (
+    "foresight-daily",
+    "foresight-predict",
+    "foresight-resolve",
+    "foresight-health",
+    "foresight-autopick",
+    "foresight-agentdaily",
+    "foresight-pmfetch",
+    "foresight-pmresolve",
+    "foresight-backup",
+    "foresight-dashboard",
+    "foresight-signsrv",
+)
 
 
 def _probe_scheduler() -> dict:
@@ -100,10 +113,12 @@ def _probe_scheduler() -> dict:
         # row keys are exactly header cells
         problems = []
         disabled = []
+        matched = 0
         for row in reader:
             name = (row.get("任务名") or row.get("TaskName") or "").strip().strip('"').lstrip("\\").lower()
             if not any(name.startswith(t) for t in _TASKS):
                 continue
+            matched += 1
             status = (row.get("计划任务状态") or row.get("Scheduled Task State") or row.get("状态") or row.get("Status") or row.get("模式") or "").strip()
             result_raw = (row.get("上次结果") or row.get("Last Result") or "").strip()
             if status.lower() in ("disabled", "已禁用"):
@@ -128,11 +143,13 @@ def _probe_scheduler() -> dict:
         has_result = any(k in reader.fieldnames for k in ("上次结果", "Last Result"))
         if not (has_status and has_result):
             raise ValueError("columns not found")
+        if matched == 0:
+            raise ValueError("no foresight tasks matched")
         if disabled:
             return {"ok": False, "level": "error", "detail": f"任务已禁用: {disabled}"}
         if problems:
             return {"ok": False, "level": "warn", "detail": "; ".join(problems)}
-        return {"ok": True, "detail": "三任务正常"}
+        return {"ok": True, "detail": f"{matched} 个任务正常"}
     except Exception as e:
         return {
             "ok": False,

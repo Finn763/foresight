@@ -87,7 +87,29 @@ def test_llm_resolve_failed_alerts(tmp_path):
     alerts = list((tmp_path / "data" / "alerts").glob("*.md"))
     assert alerts, "应生成告警文件"
     text = alerts[0].read_text(encoding="utf-8")
-    assert "LLM 揭晓失败" in text
+    assert "LLM 揭晓调用失败" in text
+
+
+def test_low_confidence_guardrail_does_not_alert(tmp_path):
+    """护栏拒判（low_confidence）≠ 故障：不落告警文件（题落人工清单，由 manual_pending 计）。"""
+    st, db = _mkdb(tmp_path)
+    now = datetime(2026, 8, 14, 10, 0)
+    _seed_rounds(st, now)
+    (tmp_path / "data" / "latest_scoreboard.json").write_text(
+        json.dumps({"date": "2026-08-14"}), encoding="utf-8"
+    )
+    st.log_evolution(
+        "llm_resolve_failed",
+        json.dumps(
+            {"qid": 27, "detail": "low_confidence: 置信度不足（0.65/0.72 < 0.7）"},
+            ensure_ascii=False,
+        ),
+    )
+    _close(st)
+    r = run_hc(db, now, tmp_path)
+    assert r.returncode == 0, r.stdout.decode("utf-8", errors="ignore")
+    alerts_dir = tmp_path / "data" / "alerts"
+    assert not alerts_dir.exists() or not list(alerts_dir.glob("*.md"))
 
 
 def test_auth_failure_single_event_alerts(tmp_path):

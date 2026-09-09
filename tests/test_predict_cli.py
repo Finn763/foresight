@@ -37,6 +37,29 @@ def test_no_evidence_rejects_prediction():
     assert pred is None  # 无证据 → 拒绝出预测，不崩溃
 
 
+def test_cli_qid_rejects_missing_and_overdue(tmp_path):
+    """--qid：不存在/已到期题 → ok=false + 可读 reason（不出网、不崩溃）。"""
+    db = tmp_path / "t.db"
+    st = Storage(str(db))
+    st.create_schema()
+    overdue = st.add_question("已到期题", datetime(2020, 1, 1))
+    st._conn.close()
+
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    for qid, expect in ((99999, "题目不存在"), (overdue, "已到期")):
+        r = subprocess.run(
+            [sys.executable, str(CLI), "--qid", str(qid), "--db", str(db)],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=ROOT,
+            timeout=60,
+        )
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        assert out["ok"] is False and expect in out["reason"]
+
+
 def test_cli_publish_draft_roundtrip(tmp_path):
     """--publish <id> 把草稿转公开；不存在的 id 返回 ok=false。"""
     db = tmp_path / "t.db"

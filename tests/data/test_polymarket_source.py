@@ -6,19 +6,11 @@ from datetime import UTC, datetime, timedelta
 import httpx
 
 from predictor.data.polymarket_source import (
-    fetch_event_markets,
-    fetch_events,
+    fetch_markets,
     select_candidates,
     translate_title,
 )
 from predictor.data.storage import Storage
-
-
-def _client(payload: list | dict) -> httpx.Client:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=payload)
-
-    return httpx.Client(transport=httpx.MockTransport(handler))
 
 
 def _market(
@@ -44,14 +36,52 @@ def _market(
     }
 
 
-def test_fetch_events_parses_list():
-    client = _client([{"id": "1"}, {"id": "2"}])
-    assert [e["id"] for e in fetch_events(client)] == ["1", "2"]
+def test_fetch_markets_parses_list_and_sends_window():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json=[{"id": "1"}, {"id": "2"}])
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    out = fetch_markets(
+        client,
+        end_date_min=datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+        end_date_max=datetime(2026, 11, 13, 12, 0, tzinfo=UTC),
+    )
+    assert [m["id"] for m in out] == ["1", "2"]
+    assert seen["closed"] == "false" and seen["active"] == "true"
+    assert seen["order"] == "volumeNum" and seen["ascending"] == "false"
+    assert seen["end_date_min"] == "2026-08-15T12:00:00Z"
+    assert seen["end_date_max"] == "2026-11-13T12:00:00Z"
 
 
-def test_fetch_event_markets_extracts_markets():
-    client = _client({"markets": [{"id": "m1"}]})
-    assert [m["id"] for m in fetch_event_markets(client, "ev1")] == ["m1"]
+def test_select_candidates_excludes_sports_and_esports():
+    """体育/电竞市场（每日赛果/对阵/联赛）一律不进池。"""
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+    markets = [
+        _market("cs", days=2, volume=999999, question="Counter-Strike: A vs B (BO3) - Group A"),
+        _market("nfl", days=2, volume=999999, question="Tush Push banned for 2026 NFL Season?"),
+        _market("match", days=2, volume=999999, question="Will Arsenal FC win on 2026-09-09?"),
+        _market("tennis", days=20, volume=999999, question="Will X win the 2026 Men's US Open?"),
+        _market("fed", days=2, volume=1000, question="Will the Fed decrease interest rates?"),
+    ]
+    out = select_candidates(markets, now=now, per_tier=9, min_volume=0)
+    assert [c.market_id for c in out] == ["fed"]
+
+
+def test_select_candidates_dedup_same_event_keeps_top_volume():
+    """同事件多市场（F1 冠军 20 个车手）只留成交量最大的一个。"""
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+    a = _market("a", days=20, volume=5000, question="Will driver A win the title?")
+    b = _market("b", days=20, volume=90000, question="Will driver B win the title?")
+    c = _market("c", days=20, volume=7000, question="Will driver C win the title?")
+    for m in (a, b, c):
+        m["events"] = [{"id": "ev-f1"}]
+    other = _market("d", days=20, volume=6000, question="Will the Fed cut rates?")
+    other["events"] = [{"id": "ev-fed"}]
+    out = select_candidates([a, b, c, other], now=now, per_tier=9, min_volume=0)
+    assert {c.market_id for c in out} == {"b", "d"}
 
 
 def test_select_candidates_tier_split_and_volume_sort():
@@ -316,6 +346,13 @@ def _pm_market(mid: str, *, days: float, volume: float = 100000.0) -> dict:
     }
 
 
+def _fake_markets(markets: list[dict]):
+    def fetch(http, limit=100, offset=0, end_date_min=None, end_date_max=None):
+        return markets if offset == 0 else []
+
+    return fetch
+
+
 def test_pm_fetch_main_db_init_failure_returns_1(monkeypatch, capsys):
     """DB 撞锁（Storage 构造抛异常）→ 优雅 exit 1 + 可读消息，不裸 traceback。"""
     mod = _load_pm_fetch()
@@ -332,16 +369,16 @@ def test_pm_fetch_main_db_init_failure_returns_1(monkeypatch, capsys):
 
 
 def test_pm_fetch_main_network_failure_returns_1(tmp_path, monkeypatch, capsys):
-    """事件列表网络失败 → 可读消息 + exit 1，不裸 traceback。"""
+    """市场列表网络失败 → 可读消息 + exit 1，不裸 traceback。"""
     mod = _load_pm_fetch()
     db = tmp_path / "pm.db"
     st = Storage(str(db))
     st.create_schema()
 
-    def boom(http, limit=100, offset=0):
+    def boom(http, **kw):
         raise httpx.ConnectError("network down")
 
-    monkeypatch.setattr(mod, "fetch_events", boom)
+    monkeypatch.setattr(mod, "fetch_markets", boom)
     monkeypatch.setattr(sys, "argv", ["pm_fetch.py", "--db", str(db)])
     assert mod.main() == 1
     out = capsys.readouterr().out
@@ -353,17 +390,9 @@ def test_pm_fetch_main_ingest_and_rerun_idempotent(tmp_path, monkeypatch, capsys
     """首轮入库 1 题；重跑 market_id 判重 → 0 新题入库（幂等）。"""
     mod = _load_pm_fetch()
     db = tmp_path / "pm.db"
-    event = {"id": "ev1", "endDate": _pm_market("x", days=7)["endDate"]}
     market = _pm_market("m-idem-1", days=7)
 
-    def fake_events(http, limit=100, offset=0):
-        return [event] if offset == 0 else []
-
-    def fake_markets(http, eid):
-        return [market] if eid == "ev1" else []
-
-    monkeypatch.setattr(mod, "fetch_events", fake_events)
-    monkeypatch.setattr(mod, "fetch_event_markets", fake_markets)
+    monkeypatch.setattr(mod, "fetch_markets", _fake_markets([market]))
     monkeypatch.setattr(
         sys, "argv", ["pm_fetch.py", "--db", str(db), "--no-translate"]
     )
@@ -384,7 +413,6 @@ def test_pm_fetch_main_ingest_and_rerun_idempotent(tmp_path, monkeypatch, capsys
 def test_pm_fetch_main_add_failure_degrades_gracefully(monkeypatch, capsys):
     """入库撞锁（add_question 抛异常）→ 单题降级不击垮整轮，退出 0 不裸 traceback。"""
     mod = _load_pm_fetch()
-    event = {"id": "ev1", "endDate": _pm_market("x", days=7)["endDate"]}
     market = _pm_market("m-lock-1", days=7)
 
     class FakeStorage:
@@ -400,15 +428,8 @@ def test_pm_fetch_main_add_failure_degrades_gracefully(monkeypatch, capsys):
         def add_question(self, *a, **kw):
             raise RuntimeError("IO Error: database is locked")
 
-    def fake_events(http, limit=100, offset=0):
-        return [event] if offset == 0 else []
-
-    def fake_markets(http, eid):
-        return [market] if eid == "ev1" else []
-
     monkeypatch.setattr(mod, "Storage", FakeStorage)
-    monkeypatch.setattr(mod, "fetch_events", fake_events)
-    monkeypatch.setattr(mod, "fetch_event_markets", fake_markets)
+    monkeypatch.setattr(mod, "fetch_markets", _fake_markets([market]))
     monkeypatch.setattr(sys, "argv", ["pm_fetch.py", "--db", "x.db", "--no-translate"])
 
     assert mod.main() == 0  # 整轮跑完（降级不算失败），不裸 traceback

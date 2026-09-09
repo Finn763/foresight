@@ -203,10 +203,17 @@ def collect(st, now: datetime, *, lock_state: str | None = None) -> list[str]:
         evs = []
     day_ago = now - timedelta(hours=24)
     recent = [e for e in evs if (e.get("ts") or now) >= day_ago]
-    resolve_failed = [e for e in recent if e.get("event_type") == "llm_resolve_failed"]
+    resolve_failed = [
+        e
+        for e in recent
+        if e.get("event_type") == "llm_resolve_failed"
+        # 只有 api_error 是真故障；no_evidence/low_confidence/disagreement 是护栏按设计
+        # 拒判（题落人工清单，由 manual_pending 计），不该弹红条
+        and "api_error" in (e.get("detail") or "")
+    ]
     skipped = [e for e in recent if e.get("event_type") == "prediction_skipped"]
     if resolve_failed:
-        alerts.append(f"LLM 揭晓失败 {len(resolve_failed)} 次（24h，api_error/护栏）")
+        alerts.append(f"LLM 揭晓调用失败 {len(resolve_failed)} 次（24h，api_error）")
     auth_fail = [
         e
         for e in skipped

@@ -87,7 +87,7 @@ MAX_ITEMS = 60          # 进入 LLM 初筛的候选上限
 WINDOW_HOURS = 48       # 只收 48h 内的新闻
 STAGE1_CHUNK = 20       # LLM 初筛每批条数
 MIN_SCORE = 7.0         # 入选最低分（0-10）
-MAX_PICKS = 2           # 每日最多建题数
+MAX_PICKS = 4           # 每日最多建题数（2026-09-09 由 2 提到 4：初筛供给常 >2 道/日，配额是瓶颈）
 MAX_HORIZON_DAYS = 90   # 揭晓时间上限
 GRACE_DAYS = 3
 

@@ -36,7 +36,7 @@ class TestMainNoTitleNonTty:
         with pytest.raises(SystemExit) as e:
             cli.main()
         assert e.value.code == 2
-        assert "需要提供预测问题文本，或用 --publish <id> 转公开" in capsys.readouterr().err
+        assert "需要提供预测问题文本，或用 --publish <id> / --qid <id>" in capsys.readouterr().err
 
 
 class TestDefaultDbFallback:

@@ -53,6 +53,7 @@ const PROJECT_ROOT = path.resolve(EXTENSION_DIR, "..", "..");
 // YOLO 运行时状态：只由「用户输入 /yolo 命令」或「--yolo 启动 flag 在 session_start 应用」修改。
 // /reload、/new、重启进程会回到 session_start 重新按 flag 决定；聊天历史里的旧通知不代表当前状态。
 let yolo = false;
+let ops = false;
 
 // 写操作输出上限：轮次类脚本 stdout 可能数百行，只保留首尾，防止撑爆上下文。
 const OUTPUT_CLIP = 20_000;
@@ -62,11 +63,54 @@ const SEQUENTIAL = "sequential" as const;
 
 const YOLO_SYSTEM_BLOCK = `\n\n# YOLO MODE（本回合生效）\n用户已通过 /yolo on 或启动参数 --yolo 显式开启 YOLO 模式。\n本回合起，SYSTEM.md 中的行为边界（预测 agent 不是 coding agent、不得修改扩展/脚本/数据库、不得绕过 predict 工具跑探索性命令）暂停适用：你可以自主使用内置 bash/edit/write 工具完成任务，也可以自主运行白名单运维工具（run_round/pm_*/crawl_social/backtest 等）且不再逐次确认。\n仍硬性保留：合规红线（政治敏感/涉财物竞猜/无牌荐股/个人隐私）、公开战绩真实性（绝不用历史事件回填战绩）、概率只原样展示工具返回值。\nYOLO 是信任模式：改代码/数据前建议先 git 留回滚点；完成运营任务后建议让用户 /yolo off。写工具的实际权限仍以扩展运行时状态为准。`;
 
+const OPS_SYSTEM_BLOCK = `\n\n# OPS MODE（本回合生效）\n用户以 --ops 启动，本会话是无人值守运维轮。已注册的写工具（run_round / pm_fetch / pm_resolve / resolve / publish / schedule_questions / crawl_social / backtest 等）免逐次确认，可直接调用。\n仍硬性保留：内置 bash/edit/write 一律拦截（不得绕过工具直接跑脚本、改文件或删改数据库记录）；SYSTEM.md 的行为边界与硬规则（合规红线、公开战绩真实性、概率原样展示）全部有效；不得自行修改扩展/脚本/数据库。\n运维轮纪律：每一步工具调用后如实汇报结果；失败就报失败并给修复建议，不猜、不重试写库动作、不输出任何非工具来源的概率数字。`;
+
 function firstExisting(...candidates: string[]): string | undefined {
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
   }
   return undefined;
+}
+
+/**
+ * 跨天上下文注入（有界）：昨日简报选题 + 未确认健康告警数。
+ * 只读两个小文件、不起 Python 进程（before_agent_start 每轮都触发）；失败静默返回空串。
+ */
+function dailyMemo(): string {
+  const parts: string[] = [];
+  try {
+    const brief = path.join(PROJECT_ROOT, "data", "daily-brief.md");
+    if (fs.existsSync(brief)) {
+      const lines = fs.readFileSync(brief, "utf-8").split("\n");
+      const dateLine = (lines.find((l) => l.startsWith("# ")) ?? "").replace(/^# /, "");
+      const titles = lines.filter((l) => l.startsWith("### ")).slice(0, 8);
+      if (titles.length) {
+        parts.push(`昨日简报（${dateLine}）选题：\n${titles.join("\n")}`);
+      }
+    }
+  } catch {
+    /* 注入失败不影响会话 */
+  }
+  try {
+    const alertsDir = path.join(PROJECT_ROOT, "data", "alerts");
+    if (fs.existsSync(alertsDir)) {
+      const unacked = fs
+        .readdirSync(alertsDir)
+        .filter((f) => f.startsWith("alert-") && f.endsWith(".md") && !f.endsWith(".ack.md"));
+      if (unacked.length) {
+        parts.push(
+          `未确认健康告警 ${unacked.length} 条：${unacked.slice(-3).join(", ")}（详情用 logs/health 工具查）`,
+        );
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  if (!parts.length) return "";
+  return (
+    `\n\n# DAILY CONTEXT（跨天记忆，自动注入）\n${parts.join("\n")}\n` +
+    "（详情用 questions / logs / health 工具查；不要凭本块编造数字。）"
+  );
 }
 
 /** 项目 .venv 的 python（Windows 下 venv 解释器在 .venv/Scripts/python.exe）。 */
@@ -147,19 +191,21 @@ async function runReadJson(
 }
 
 /**
- * 写操作闸门：YOLO 开 → 放行；YOLO 关 → 交互模式弹确认框，-p/无 UI 一律拒绝。
+ * 写操作闸门：YOLO/OPS 开 → 放行；都关 → 交互模式弹确认框，-p/无 UI 一律拒绝。
  * 返回 undefined 表示允许，否则返回拒绝说明（由调用方作为工具结果原样返回）。
+ * 注：OPS 只放行「注册写工具」（本闸门唯一入口）；内置 bash/edit/write 由 tool_call 钩子另行拦截。
  */
 async function writeGate(
   ctx: { hasUI: boolean; ui: { confirm: (title: string, message: string) => Promise<boolean> } },
   operation: string,
   detail: string,
 ): Promise<string | undefined> {
-  if (yolo) return undefined;
+  if (yolo || ops) return undefined;
   if (!ctx.hasUI) {
     return (
-      `已拒绝写操作「${operation}」：当前 YOLO 关闭且无交互 UI（-p/headless）。` +
-      `未执行任何命令。需要无人值守执行请用 foresight --yolo 启动，或在 TUI 里 /yolo on。`
+      `已拒绝写操作「${operation}」：当前 YOLO/OPS 均关闭且无交互 UI（-p/headless）。` +
+      `未执行任何命令。无人值守请用 foresight --ops 启动（只放行注册写工具），` +
+      `或 --yolo（全放开），或在 TUI 里 /yolo on。`
     );
   }
   try {
@@ -270,7 +316,7 @@ interface BridgeContract {
     confirmGate: string;
     sequential: string;
   };
-  /** 通道清单（22 条 = 11 只读 + 11 写；第三条通道的 9 个 inline_json 已全部契约化） */
+  /** 通道清单（23 条 = 11 只读 + 12 写；第三条通道的 9 个 inline_json 已全部契约化） */
   channels: readonly BridgeChannelContract[];
 }
 
@@ -402,8 +448,9 @@ const BRIDGE_CONTRACT: BridgeContract = {
       backend: "script",
       entry: "scripts/predict_cli.py",
       params: [
-        { name: "question", required: true },
+        { name: "question", required: false },
         { name: "closes", required: false },
+        { name: "qid", required: false },
       ],
       timeoutMs: PREDICT_TOOL_TIMEOUT_MS,
     },
@@ -444,6 +491,17 @@ const BRIDGE_CONTRACT: BridgeContract = {
       timeoutMs: 300_000,
     },
     {
+      name: "autopick",
+      kind: "write",
+      backend: "script",
+      entry: "scripts/autopick.py",
+      params: [
+        { name: "dry_run", required: false },
+        { name: "max_picks", required: false },
+      ],
+      timeoutMs: 900_000,
+    },
+    {
       name: "pm_fetch",
       kind: "write",
       backend: "script",
@@ -451,7 +509,6 @@ const BRIDGE_CONTRACT: BridgeContract = {
       params: [
         { name: "dry_run", required: false },
         { name: "public", required: false },
-        { name: "max_events", required: false },
         { name: "per_tier", required: false },
         { name: "min_volume", required: false },
         { name: "no_translate", required: false },
@@ -731,7 +788,15 @@ const READ_BODY_LOGS = readBody("logs", [
   "else:",
   "    log_path = Path(Settings().db_path).parent / f'{name}.log'",
   "    try:",
-  "        lines = log_path.read_text(encoding='gbk', errors='replace').splitlines()[-int(p.get('lines', 100)):]",
+  "        raw = log_path.read_bytes().splitlines()",
+  "        # 混合编码：run_silent 新段 utf-8 / cmd 时代旧段 gbk —— 逐行 utf-8 优先、失败回退 gbk",
+  "        lines = []",
+  "        for b in raw:",
+  "            try:",
+  "                lines.append(b.decode('utf-8'))",
+  "            except UnicodeDecodeError:",
+  "                lines.append(b.decode('gbk', errors='replace'))",
+  "        lines = lines[-int(p.get('lines', 100)):]",
   "        _out = {'name': name, 'count': len(lines), 'lines': lines}",
   "    except OSError:",
   "        _out = {'name': name, 'count': 0, 'lines': [], 'error': 'log file not found'}",
@@ -744,23 +809,41 @@ export default function (pi: ExtensionAPI) {
     default: false,
   });
 
+  pi.registerFlag("ops", {
+    description: "运维轮模式：放行已注册写工具（免确认），内置 bash/edit/write 仍拦截",
+    type: "boolean",
+    default: false,
+  });
+
   // flags 在扩展加载期不可读（官方约定），session_start 时应用一次。
   pi.on("session_start", (_event, ctx) => {
     const flag = pi.getFlag("yolo");
     yolo = flag === true || flag === "true";
+    const opsFlag = pi.getFlag("ops");
+    ops = opsFlag === true || opsFlag === "true";
     if (yolo) {
       ctx.ui.notify("YOLO 模式已开启（--yolo 启动参数）", "warning");
+    } else if (ops) {
+      ctx.ui.notify(
+        "OPS 模式已开启（--ops 启动参数）：注册写工具免确认，bash/edit/write 仍拦截",
+        "info",
+      );
     }
   });
 
-  // 每一轮 agent 启动时，把当前 YOLO 状态注入 system prompt，模型无需猜测。
+  // 每一轮 agent 启动时：注入 YOLO/OPS 状态 + 跨天上下文（昨日简报选题/未确认告警）。
   pi.on("before_agent_start", (event) => {
-    if (!yolo) return undefined;
-    return { systemPrompt: `${event.systemPrompt}${YOLO_SYSTEM_BLOCK}` };
+    const blocks: string[] = [];
+    if (yolo) blocks.push(YOLO_SYSTEM_BLOCK);
+    else if (ops) blocks.push(OPS_SYSTEM_BLOCK);
+    blocks.push(dailyMemo());
+    const extra = blocks.join("");
+    return extra ? { systemPrompt: `${event.systemPrompt}${extra}` } : undefined;
   });
 
   // YOLO 关闭时硬拦截内置 bash/edit/write：写闸门不能只包扩展工具，否则模型可用
   // 内置 bash 直接跑 scripts/*.py 绕过确认。read/grep/find 保留给最小只读诊断。
+  // OPS 模式同样走这条拦截（只放行注册写工具，不放开内置 coding 工具）。
   pi.on("tool_call", (event) => {
     if (yolo) return undefined;
     if (event.toolName === "bash" || event.toolName === "edit" || event.toolName === "write") {
@@ -1014,7 +1097,7 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "logs",
       label: "Tail Logs",
-      description: "运维日志尾部（只读）：daily.log 或 evolve.log 最后 N 行（GBK 容错）",
+      description: "运维日志尾部（只读）：daily.log 或 evolve.log 最后 N 行（utf-8/gbk 混合编码逐行容错）",
       parameters: Type.Object({
         name: Type.Union([Type.Literal("daily"), Type.Literal("evolve")]),
         lines: Type.Optional(Type.Integer({ minimum: 10, maximum: 500, default: 100 })),
@@ -1084,16 +1167,33 @@ export default function (pi: ExtensionAPI) {
     defineTool({
       name: "predict",
       label: "Predict",
-      description: "Foresight 预测引擎：对给定事件出概率+依据+报告（建草稿题，输出单行 JSON）",
+      description:
+        "Foresight 预测引擎：新建题出概率（question），或对已存在未揭晓题重新预测（qid）。输出单行 JSON。",
       parameters: Type.Object({
-        question: Type.String({ maxLength: 2000, description: "预测问题，如：美联储9月会加息吗" }),
+        question: Type.Optional(
+          Type.String({ maxLength: 2000, description: "预测问题文本（新建草稿题）；与 qid 二选一" }),
+        ),
         closes: Type.Optional(Type.String({ description: "揭晓日期 YYYY-MM-DD，缺省 30 天后" })),
+        qid: Type.Optional(
+          Type.Integer({ minimum: 1, description: "已存在未揭晓题的 id，重新预测该题；与 question 二选一" }),
+        ),
       }),
       executionMode: SEQUENTIAL,
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-        const args = [];
-        if (params.closes) args.push("--closes", params.closes);
-        args.push("--", params.question);
+        const args: string[] = [];
+        if (params.qid !== undefined) {
+          args.push("--qid", String(params.qid));
+        } else if (params.question) {
+          if (params.closes) args.push("--closes", params.closes);
+          args.push("--", params.question);
+        } else {
+          return {
+            content: [
+              { type: "text", text: "predict：需要 question（新建题）或 qid（存量题重预测）之一。" },
+            ],
+            details: {},
+          };
+        }
         const { stdout } = await runPython(
           pi,
           ctx.cwd,
@@ -1250,6 +1350,41 @@ export default function (pi: ExtensionAPI) {
   contractTool(
     pi,
     defineTool({
+      name: "autopick",
+      label: "Autopick",
+      description:
+        "自主选题引擎：扫新闻源 → LLM 初筛/出题 → 落盘候选题 JSON + 简报。dry_run=true（缺省）只跑流程不落盘；dry_run=false 才写文件并弹确认框（不直接写库，入库由 autopick_ingest 完成）。",
+      parameters: Type.Object({
+        dry_run: Type.Optional(Type.Boolean({ default: true })),
+        max_picks: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, default: 4 })),
+      }),
+      executionMode: SEQUENTIAL,
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const args = ["scripts/autopick.py", "--max-picks", String(params.max_picks ?? 4)];
+        const dry = params.dry_run !== false;
+        if (dry) {
+          args.push("--dry-run");
+          const { stdout } = await runPython(pi, ctx.cwd, args, channelTimeout("autopick"), signal);
+          return { content: [{ type: "text", text: clipText(stdout) }], details: {} };
+        }
+        const out = await runWriteScript(
+          pi,
+          ctx,
+          "autopick（落盘）",
+          "将执行 python scripts/autopick.py（非 dry-run）。副作用：写 data/autopick/*.json 与 " +
+            "data/daily-brief.md（不入库；入库需另跑 scripts/autopick_ingest.py）。",
+          args,
+          channelTimeout("autopick"),
+          signal,
+        );
+        return { content: [{ type: "text", text: out }], details: {} };
+      },
+    }),
+  );
+
+  contractTool(
+    pi,
+    defineTool({
       name: "pm_fetch",
       label: "PM Fetch",
       description:
@@ -1257,8 +1392,7 @@ export default function (pi: ExtensionAPI) {
       parameters: Type.Object({
         dry_run: Type.Optional(Type.Boolean({ default: true })),
         public: Type.Optional(Type.Boolean({ description: "入库为公开题（默认内部题）" })),
-        max_events: Type.Optional(Type.Integer({ minimum: 50, maximum: 1000, default: 300 })),
-        per_tier: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, default: 6 })),
+        per_tier: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, default: 8 })),
         min_volume: Type.Optional(Type.Number({ minimum: 0, default: 1000 })),
         no_translate: Type.Optional(Type.Boolean()),
       }),
@@ -1266,10 +1400,8 @@ export default function (pi: ExtensionAPI) {
       async execute(_toolCallId, params, signal, _onUpdate, ctx) {
         const args = [
           "scripts/pm_fetch.py",
-          "--max-events",
-          String(params.max_events ?? 300),
           "--per-tier",
-          String(params.per_tier ?? 6),
+          String(params.per_tier ?? 8),
           "--min-volume",
           String(params.min_volume ?? 1000),
         ];

@@ -1,19 +1,19 @@
 {
   "name": "foresight-agent",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Foresight prediction agent engine — event probability prediction with Brier-scored track record.",
   "license": "MIT",
   "bin": {
-    "foresight": "bin/foresight.js"
+    "foresight-engine": "bin/foresight.js"
   },
   "files": [
     "bin"
   ],
   "optionalDependencies": {
-    "foresight-agent-win32-x64": "0.3.1",
-    "foresight-agent-darwin-x64": "0.3.1",
-    "foresight-agent-darwin-arm64": "0.3.1",
-    "foresight-agent-linux-x64": "0.3.1"
+    "foresight-agent-win32-x64": "0.4.0",
+    "foresight-agent-darwin-x64": "0.4.0",
+    "foresight-agent-darwin-arm64": "0.4.0",
+    "foresight-agent-linux-x64": "0.4.0"
   },
   "engines": {
     "node": ">=18"

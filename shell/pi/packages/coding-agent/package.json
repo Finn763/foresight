@@ -1,7 +1,7 @@
 {
 	"name": "@foresight/foresight-agent",
-	"version": "0.84.4",
-	"description": "Coding agent CLI with read, bash, edit, write tools and session management",
+	"version": "0.3.1",
+	"description": "Event probability prediction agent shell (pi fork): predict / questions / leaderboard tools, sessions, multi-provider",
 	"type": "module",
 	"piConfig": {
 		"name": "foresight",

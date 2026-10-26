@@ -2,10 +2,13 @@
 
 import asyncio
 import json
+import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -14,11 +17,36 @@ from predictor.llm.client import LLMError
 from predictor.websearch_predictor import _extract_citations, _sample, websearch_predict
 
 
+@pytest.fixture(autouse=True)
+def _no_calibrator(monkeypatch):
+    """概率断言针对原始均值：屏蔽本地 data/calibrator.json（校准器另有单测）。"""
+    monkeypatch.setattr("predictor.websearch_predictor.load_calibrator", lambda path: None)
+
+
 class FakeClient:
-    def __init__(self, responses, delay: float = 0.0):
+    """search 结果池默认 = 队列里出现过的全部 URL（模拟检索覆盖测试引用）。"""
+
+    def __init__(self, responses, delay: float = 0.0, search_urls=None):
         self._responses = list(responses)
         self.calls = []
         self.delay = delay
+        self.search_calls = []
+        if search_urls is not None:
+            self.search_urls = list(search_urls)
+        else:
+            self.search_urls = sorted(
+                set(re.findall(r'https?://[^"\\\s,\])]+', json.dumps(self._responses)))
+            )
+
+    def search(self, query, **kw):
+        self.search_calls.append((query, kw))
+        return [
+            {"title": f"结果{i}", "url": u, "summary": f"关于 {query} 的证据 {i}", "authority": 3}
+            for i, u in enumerate(self.search_urls)
+        ]
+
+    async def asearch(self, query, **kw):
+        return self.search(query, **kw)
 
     def responses_create(self, **kw):
         """同步路径（_sample 串行基准用）。"""
@@ -101,8 +129,10 @@ def test_two_samples_mean_and_merged_citations():
     assert pred.probability == (0.30 + 0.34) / 2
     assert pred.evidence_ids, "引用应落库"
     assert len(pred.evidence_ids) == 4  # verdict citations ∪ open_page：a/1,b/2,o/1,o/2
-    assert c.calls[0]["tools"] == [{"type": "web_search"}]
-    assert c.calls[0]["tool_choice"] == {"type": "web_search"}
+    assert c.calls[0]["tools"] == []  # 搜索改走 /v1/tools/search，Responses 不再带工具
+    assert c.calls[0]["tool_choice"] == "none"
+    assert "【检索结果】" in c.calls[0]["instructions"]  # 证据块已注入
+    assert c.search_calls, "必须先调 DeepSeek Search 拉证据"
     assert "美联储" in c.calls[0]["instructions"]
     assert c.calls[0]["temperature"] == 0.5
 
@@ -181,19 +211,35 @@ def test_all_samples_fail_returns_none_and_logs():
     assert any("all samples failed" in (e.get("detail") or "") for e in evs)
 
 
-def test_missing_web_search_call_discards_sample():
+def test_citation_outside_search_results_discarded():
+    """护栏：引用必须落在本次检索结果 URL 内（搜到 A，却引 B → 过滤后无引用 → 拒）。"""
     st, qid = _st()
     c = FakeClient(
         [
-            _msg_response(0.30, "r", ["https://a/1"], [], with_search=False),
-            _msg_response(0.40, "r", ["https://b/2"], []),
-        ]
+            _msg_response(0.30, "r", ["https://fake/9"], [], with_search=False),
+            _msg_response(0.40, "r", ["https://fake/8"], [], with_search=False),
+        ],
+        search_urls=["https://real/1"],
     )
     pred = websearch_predict(
         qid, "t", datetime(2026, 9, 17, 9, 0), datetime(2026, 8, 13, 20, 0), c, st, n_samples=2
     )
-    assert pred is not None
-    assert pred.probability == 0.40
+    assert pred is None
+    evs = st.list_evolution_log()
+    assert any("no_evidence" in (e.get("detail") or "") for e in evs)
+
+
+def test_search_empty_discards_sample():
+    """检索无结果 → 该采样作废（无证据不判定）；全作废 → None。"""
+    st, qid = _st()
+    c = FakeClient([_msg_response(0.30, "r", [], [])], search_urls=[])
+    pred = websearch_predict(
+        qid, "t", datetime(2026, 9, 17, 9, 0), datetime(2026, 8, 13, 20, 0), c, st, n_samples=1
+    )
+    assert pred is None
+    assert c.calls == [], "搜索无结果时不应再调 LLM"
+    evs = st.list_evolution_log()
+    assert any("all samples failed" in (e.get("detail") or "") for e in evs)
 
 
 def test_baseline_and_historical_context_injected():

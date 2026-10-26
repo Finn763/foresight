@@ -24,3 +24,6 @@ docs/预测Agent-*
 docs/agent-first-audit-*.md
 docs/cc-*.md
 docs/hermes-*.md
+# 本地产物（pytest TMP 指向仓库根 / pi 任务与暂存目录）
+pytest-of-*/
+.pi/

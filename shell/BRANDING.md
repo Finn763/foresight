@@ -10,6 +10,10 @@
 - Fork 基线版本：**v0.84.4**（2026-09-04 从 v0.84.1 同步，基线 commit `b79e4cc83` Release v0.84.4；原基线 v0.84.1/`40a3d85`）
 - 上游全局安装对照：`npm i -g @earendil-works/pi-coding-agent` = 0.84.4
 - 本 fork 目录：`shell/pi/`，包名 `@foresight/foresight-agent`
+- 版本号政策（2026-09-04）：**跟 Foresight 走，不跟 pi**——`packages/coding-agent/package.json`
+  的 `version` 与预测引擎对齐（如 `0.3.1`），`--version` 显示 Foresight 版本；
+  底层 pi 基线记在这里（上节），升级只换基线不动版本号。同步 rebase 时 version
+  行必冲突，一律保留我方版本。
 
 ## 改名原理（为什么只改 package.json 就够了）
 
@@ -44,6 +48,9 @@ export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
    - 影响面：仅扩展加载性能（无磁盘缓存，每次冷加载重编译扩展），扩展体量小、可忽略；内存在进程 moduleCache:false 本来就不缓存。
 
 构建产物为 `packages/coding-agent/dist/bundle/cli.js`（0.84.2+ 上游改打包路径；npm link 后全局命令 `foresight` 指向它）。
+注（2026-09-04）：裸 `foresight` 归交互 agent 所有；Python 预测引擎直调走
+`~/.local/bin/foresight.exe`（uv tool 安装）。两者是同一产品的前后端，
+不要把 npm 预测包 link 到 `foresight` 名下抢占。
 
 ## 已知残留（不改，无功能影响）
 

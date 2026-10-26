@@ -160,7 +160,7 @@ def _open_storage_with_retry(db_path: str, *, attempts: int = 6, delay: float = 
     """
     from predictor.data.storage import Storage
 
-    last = None
+    last: Exception = RuntimeError(f"无法打开数据库：{db_path}")
     for attempt in range(attempts):
         try:
             return Storage(db_path)
@@ -171,7 +171,7 @@ def _open_storage_with_retry(db_path: str, *, attempts: int = 6, delay: float = 
     raise last
 
 
-def collect(st, now: datetime, *, lock_state: str | None = None) -> list[str]:
+def collect(st, now: datetime, *, lock_state: str | None = None) -> tuple[list[str], dict]:
     """收集告警条目：health.assess 的 error 项 + 24h 失败事件规则。
 
     lock_state 透传给 build_facts：health_check 持锁入场后锁文件已被自己重写为
@@ -255,10 +255,7 @@ def _prediction_gap_assertion(db_path: str, now: datetime) -> list[str]:
                     continue
                 due += 1
             if due:
-                return [
-                    f"今日 predictions 新增 0 行，应预测 {due} 题"
-                    "（未到期且距上次预测 ≥ 7 天）"
-                ]
+                return [f"今日 predictions 新增 0 行，应预测 {due} 题（未到期且距上次预测 ≥ 7 天）"]
             return []
         finally:
             st.close()
@@ -289,12 +286,14 @@ def main(argv=None) -> int:
 
     db_path = args.db or Settings().db_path
     out_dir = Path(db_path).parent / "alerts"  # 不依赖 cwd（schtasks 工作目录不可控）
-    # 每次巡检顺手清理超 30 天的告警（即使今天零告警也执行；目录不存在时是 no-op）
-    cleanup_stale_alerts(out_dir, datetime.now())
+    now = datetime.fromisoformat(args.now) if args.now else datetime.now()
+    # 每次巡检顺手清理超 30 天的告警（即使今天零告警也执行；目录不存在时是 no-op）。
+    # 必须用 now（而非 wall clock）：--now 注入时若按真实日期清理，会把当天刚写的告警当过期删掉。
+    cleanup_stale_alerts(out_dir, now)
     lock_path = Path(db_path).parent / "evolve.lock"
-    try:
-        from predictor.ops.lock import LockWaitTimeout, wait_acquire
+    from predictor.ops.lock import LockWaitTimeout, wait_acquire
 
+    try:
         # 排队等 evolve.lock（上限 --lock-wait 秒）：轮次持锁时轮询等待而非撞库重试，
         # 拿到锁后持锁执行全部 DB 读（与轮次互斥，杜绝对撞）；锁状态事实固定 "none"
         # （锁文件此刻已是自身 pid，现场判定会误报 active）。
@@ -306,7 +305,6 @@ def main(argv=None) -> int:
         ):
             st = _open_storage_with_retry(db_path)
             st.create_schema()
-            now = datetime.fromisoformat(args.now) if args.now else datetime.now()
             alerts, report = collect(st, now, lock_state="none")
             st.close()  # 释放 rw 连接，业务断言改走 read_only（同进程 rw+ro 并存会被 DuckDB 拒绝）
             alerts += _prediction_gap_assertion(db_path, now)

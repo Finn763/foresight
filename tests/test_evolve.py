@@ -4,15 +4,28 @@
 acquire_lock 上下文管理器），落地为仅导入实际存在的符号。
 """
 
+import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from predictor.data.storage import Storage
 from scripts.evolve import acquire_lock, predict_round, resolve_round, write_weekly_review
+
+
+def _res(st, qid) -> dict:
+    r = st.question_resolution(qid)
+    assert r is not None
+    return r
+
+
+def _db(st) -> sqlite3.Connection:
+    assert st._conn is not None
+    return st._conn
 
 
 def test_lock_exclusive(tmp_path):
@@ -50,7 +63,7 @@ def test_resolve_question_brier_failure_logs_not_raises():
     st = Storage(":memory:")
     st.create_schema()
     qid = st.add_question("题", datetime.now() - timedelta(days=1))
-    st.add_prediction(qid, 0.5, evidence_ids=[1], model_runs=None)  # 损坏 model_runs
+    st.add_prediction(qid, 0.5, evidence_ids=[1], model_runs=cast(dict, None))  # 损坏 model_runs
     st.resolve_question(qid, True, "test")  # 不抛
     assert st.get_question(qid).outcome is True
     evs = st._conn.execute("SELECT event_type FROM evolution_log").fetchall()
@@ -140,7 +153,7 @@ def test_resolve_round_timeout_degrades_class_b(tmp_path, monkeypatch):
     monkeypatch.setattr(ar, "get_resolver", lambda cls, storage=None: None)  # 不触网
     stats = resolve_round(st, now=now, data_dir=tmp_path)
     assert stats["timeouts"] == 1
-    assert st.question_resolution(qid)["class"] == "C"
+    assert _res(st, qid)["class"] == "C"
     assert stats["manual_c"] == 1
 
 
@@ -169,23 +182,29 @@ def test_resolve_round_timeout_degrades_to_manual_once(tmp_path):
     )
     stats = resolve_round(st, now=now)
     assert stats["timeouts"] == 1
-    assert st.question_resolution(qid)["class"] == "C"  # 降级人工
+    assert _res(st, qid)["class"] == "C"  # 降级人工
     assert stats["manual_c"] == 1  # 进入待人工揭晓清单
     stats2 = resolve_round(st, now=now)
     assert stats2["timeouts"] == 0  # 幂等：第二轮不再判定超时
-    events = st._conn.execute(
-        "SELECT COUNT(*) FROM evolution_log WHERE event_type = 'resolution_timeout'"
-    ).fetchone()[0]
+    events = (
+        _db(st)
+        .execute("SELECT COUNT(*) FROM evolution_log WHERE event_type = 'resolution_timeout'")
+        .fetchone()[0]
+    )
     assert events == 1  # 每题只记一次
     # T7 审查裁定：超时降级同轮补记归档事件（resolution_archived），语义 = 延迟
     # >7 天未揭晓题由宽限降级人工覆盖，未揭晓题不进技能桶（brier 只计 IS NOT NULL）
-    archived = st._conn.execute(
-        "SELECT COUNT(*) FROM evolution_log WHERE event_type = 'resolution_archived'"
-    ).fetchone()[0]
+    archived = (
+        _db(st)
+        .execute("SELECT COUNT(*) FROM evolution_log WHERE event_type = 'resolution_archived'")
+        .fetchone()[0]
+    )
     assert archived == 1
-    row = st._conn.execute(
-        "SELECT detail FROM evolution_log WHERE event_type = 'resolution_archived'"
-    ).fetchone()[0]
+    row = (
+        _db(st)
+        .execute("SELECT detail FROM evolution_log WHERE event_type = 'resolution_archived'")
+        .fetchone()[0]
+    )
     assert "timeout_manual_degrade" in row and f'"qid": {qid}' in row
 
 
@@ -214,7 +233,7 @@ def test_resolve_round_broken_grace_days_does_not_crash(tmp_path):
     )
     stats = resolve_round(st, now=now)  # 不崩溃（修复前 int("abc") 抛 ValueError）
     assert stats["timeouts"] == 1  # 回退默认宽限后仍进超时降级路径
-    assert st.question_resolution(qid)["class"] == "C"
+    assert _res(st, qid)["class"] == "C"
     types = [
         r[0]
         for r in st._conn.execute("SELECT event_type FROM evolution_log ORDER BY id").fetchall()
@@ -238,7 +257,8 @@ def test_write_weekly_review_monday(tmp_path):
 def test_predict_round_predicts_newly_added_family_immediately(tmp_path):
     """出题即预测：超短题 closes=次日，predict_round 循环快照不含当轮新题——
     不立即预测则下轮 closes 已过、题永远无预测（8-13 预演发现）。
-    （2026-08-13 起预测走 websearch 引擎，fake client 提供 responses_create。）"""
+    （2026-08-13 起预测走 websearch 引擎，fake client 提供 responses_create；
+    2026-10 搜索改独立接口后另提供 search/aresearch。）"""
     import json
 
     def _resp(prob=0.55):
@@ -261,6 +281,13 @@ def test_predict_round_predicts_newly_added_family_immediately(tmp_path):
         }
 
     class FakeClient:
+        def search(self, query, **kw):
+            # 2026-10 起搜索走 /v1/tools/search：引用白名单 = 本次检索结果
+            return [{"title": "结果", "url": "http://e", "summary": f"关于 {query} 的证据"}]
+
+        async def asearch(self, query, **kw):
+            return self.search(query, **kw)
+
         def responses_create(self, **kw):
             return _resp()
 
@@ -274,14 +301,18 @@ def test_predict_round_predicts_newly_added_family_immediately(tmp_path):
     stats = predict_round(st, now=now, client=FakeClient(), sources=[], base_rates={})
     assert stats["families_added"] >= 1
     assert stats["predicted"] >= 1, "新增族题应立即预测（超短题错过本轮将永远无预测）"
-    n_no_pred = st._conn.execute("""
+    n_no_pred = (
+        _db(st)
+        .execute("""
         SELECT COUNT(*) FROM questions q
         LEFT JOIN predictions p ON p.question_id = q.id
         WHERE p.id IS NULL
-    """).fetchone()[0]
+    """)
+        .fetchone()[0]
+    )
     assert n_no_pred == 0, "所有新增族题应有预测"
     # F2：题族循环写 question_added 事件（spec §4.1；daily 缺席的备援日时间线不缺出题事件）
-    qid = st._conn.execute("SELECT id FROM questions ORDER BY id").fetchone()[0]
+    qid = _db(st).execute("SELECT id FROM questions ORDER BY id").fetchone()[0]
     qa_rows = st._conn.execute(
         "SELECT detail FROM evolution_log WHERE event_type = 'question_added'"
     ).fetchall()

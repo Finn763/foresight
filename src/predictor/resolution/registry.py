@@ -1,4 +1,4 @@
-"""A 类 resolver 注册表。A → MarketResolver；B → LLMResolver（Responses API web_search）；C → None。"""
+"""A 类 resolver 注册表。A → MarketResolver；B → LLMResolver（DeepSeek Search + 双采样）；C → None。"""
 
 from predictor.resolution.market_resolver import SYMBOL_MAP, MarketResolver
 from predictor.resolution.quotes import fetch_close, fetch_kline, fetch_prev_close

@@ -1,6 +1,7 @@
 """LLMResolver 单测（fake client 注入，零网络）：四护栏/双采样/窗口/3-tuple 契约。"""
 
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -85,9 +86,25 @@ def _msg_response(outcome, confidence, citations, open_urls):
 
 
 class FakeClient:
-    def __init__(self, responses):
+    """search 结果池默认 = 队列里出现过的全部 URL（模拟检索覆盖测试引用）。"""
+
+    def __init__(self, responses, search_urls=None):
         self._responses = list(responses)  # 按采样顺序弹出
         self.calls = []
+        self.search_calls = []
+        if search_urls is not None:
+            self.search_urls = list(search_urls)
+        else:
+            self.search_urls = sorted(
+                set(re.findall(r'https?://[^"\\\s,\])]+', json.dumps(self._responses)))
+            )
+
+    def search(self, query, **kw):
+        self.search_calls.append((query, kw))
+        return [
+            {"title": f"结果{i}", "url": u, "summary": f"关于 {query} 的证据"}
+            for i, u in enumerate(self.search_urls)
+        ]
 
     def responses_create(self, **kw):
         self.calls.append(kw)
@@ -118,8 +135,10 @@ def test_agree_returns_verdict_with_merged_citations():
     # prompt 锚定题面与截止时间（窗口语义：禁止拿当前状态判定）
     assert "35°C" in c.calls[0]["instructions"]
     assert "2026-08-13T09:00:00" in c.calls[0]["instructions"]
-    assert c.calls[0]["tools"] == [{"type": "web_search"}]
-    assert c.calls[0]["tool_choice"] == {"type": "web_search"}
+    assert c.calls[0]["tools"] == []  # 搜索改走 /v1/tools/search，Responses 不再带工具
+    assert c.calls[0]["tool_choice"] == "none"
+    assert "【检索结果】" in c.calls[0]["instructions"]  # 证据块已注入
+    assert c.search_calls, "必须先调 DeepSeek Search 拉证据"
 
 
 def test_message_item_real_structure_resolves():
@@ -147,6 +166,7 @@ def test_message_item_real_structure_resolves():
     )
     r = LLMResolver(c)
     out = r.resolve(_q(datetime(2026, 8, 13, 9, 0)), _spec(), datetime(2026, 8, 14, 16, 30))
+    assert out is not None
     assert out[0] is False and out[1] == "llm_websearch"
     assert out[2]["confidence"] == 0.95
     assert "https://www.nmc.cn/publish/forecast/ABJ/beijing.html" in out[2]["citations"]
@@ -332,29 +352,39 @@ def test_citations_string_form_declines_no_evidence():
     assert "no_evidence" in evs[0][0]
 
 
-def test_missing_web_search_call_declines_as_api_error():
-    # M-2：响应无 web_search_call 条目（搜索未发生）→ 引用必为幻觉 → api_error
+def test_citation_outside_search_results_declines_no_evidence():
+    # 护栏：引用必须落在本次检索结果 URL 内（搜到 A 却引 B → 过滤后为空 → no_evidence）
     st = Storage(":memory:")
     st.create_schema()
-    c = FakeClient(
-        [
+    hallucinated = {
+        "output": [
             {
-                "output": [
-                    {
-                        "type": "output_text",
-                        "id": "o1",
-                        "content": json.dumps(
-                            {"outcome": True, "confidence": 0.9, "citations": ["https://a/1"]}
-                        ),
-                    }
-                ]
-            },
-            _ok_response(True, 0.9, ["https://a/1"]),
+                "type": "output_text",
+                "id": "o1",
+                "content": json.dumps(
+                    {"outcome": True, "confidence": 0.9, "citations": ["https://h/1"]}
+                ),
+            }
         ]
-    )
+    }
+    c = FakeClient([hallucinated, hallucinated], search_urls=["https://real/1"])
     r = LLMResolver(c, storage=st)
     assert (
         r.resolve(_q(datetime(2026, 8, 13, 9, 0)), _spec(), datetime(2026, 8, 14, 16, 30)) is None
     )
+    evs = st._conn.execute("SELECT detail FROM evolution_log ORDER BY id DESC LIMIT 1").fetchall()
+    assert "no_evidence" in evs[0][0]
+
+
+def test_search_empty_declines_as_api_error():
+    # 检索无结果 → 无证据可判 → 采样作废（api_error 兼底），不再盲调 LLM
+    st = Storage(":memory:")
+    st.create_schema()
+    c = FakeClient([], search_urls=[])
+    r = LLMResolver(c, storage=st)
+    assert (
+        r.resolve(_q(datetime(2026, 8, 13, 9, 0)), _spec(), datetime(2026, 8, 14, 16, 30)) is None
+    )
+    assert c.calls == []
     evs = st._conn.execute("SELECT detail FROM evolution_log ORDER BY id DESC LIMIT 1").fetchall()
     assert "api_error" in evs[0][0]

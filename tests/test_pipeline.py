@@ -57,7 +57,7 @@ def test_run_prediction_end_to_end():
 
 def test_run_prediction_rejects_missing_question():
     class NoQuestionStore(FakeStore):
-        def get_question(self, qid):
+        def get_question(self, qid):  # type: ignore[override]  # 故意返回 None 模拟题目不存在
             return None
 
     assert (
@@ -83,7 +83,7 @@ def test_run_prediction_keeps_all_samples_in_model_runs():
     store = FakeStore()
     pred = run_prediction(1, store, FakeClient(), [FakeSource()], now=datetime(2026, 8, 2))
     assert pred is not None
-    assert pred.model_runs["deepseek-v4-flash"] == [0.55, 0.55, 0.55]  # n_samples=3 全量采样
+    assert pred.model_runs["deepseek-flash"] == [0.55, 0.55, 0.55]  # n_samples=3 全量采样
     assert store.preds == [pred.probability]
 
 

@@ -40,9 +40,7 @@ def _record_usage(data) -> None:
         unknown = 1
     day = date.today().isoformat()
     with _DAILY_USAGE_LOCK:
-        rec = _DAILY_USAGE.setdefault(
-            day, {"prompt": 0, "completion": 0, "calls": 0, "unknown": 0}
-        )
+        rec = _DAILY_USAGE.setdefault(day, {"prompt": 0, "completion": 0, "calls": 0, "unknown": 0})
         rec["prompt"] += prompt
         rec["completion"] += completion
         rec["calls"] += 1
@@ -164,7 +162,9 @@ class LLMClient:
             msg = data["choices"][0]["message"]
             if not (msg.get("content") or ""):
                 if attempt < self.max_retries:
-                    pl["max_tokens"] = min(pl.get("max_tokens", 4096) * 2, _MAX_OUTPUT_TOKENS_CEILING)
+                    pl["max_tokens"] = min(
+                        pl.get("max_tokens", 4096) * 2, _MAX_OUTPUT_TOKENS_CEILING
+                    )
                 return False
             return True
 
@@ -185,6 +185,38 @@ class LLMClient:
         except json.JSONDecodeError as e:
             raise LLMError(f"LLM 返回非法 JSON: {raw[:200]}") from e
 
+    async def asearch(
+        self,
+        query: str,
+        *,
+        count: int = 10,
+        need_content: bool = False,
+        ori_question: str | None = None,
+    ) -> list[dict]:
+        """DeepSeek Search API（POST /v1/tools/search，2026-10 官方文档）：results 原样列表。
+
+        这是独立 REST 接口，不是 /v1/responses 的服务端工具：后者请求会被受理但不再
+        真正执行搜索（output 无 web_search_call，模型自述无搜索工具）——2026-09-09
+        起预测/揭晓全灭即此因。结果按请求次数计费（5元/千次，空结果不计费）。
+        """
+        payload: dict[str, Any] = {
+            "query": query[:128],
+            "count": max(1, min(50, count)),
+            "need_content": need_content,
+        }
+        if ori_question:
+            payload["ori_question"] = ori_question[:128]
+        url = f"{self.base_url}/v1/tools/search"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
+            data = await _post_with_retry(client, url, payload, headers, self.max_retries, None)
+        results = data.get("results") if isinstance(data, dict) else None
+        return results if isinstance(results, list) else []
+
+    def search(self, query: str, **kw) -> list[dict]:
+        """同步封装（揭晓器等同步调用点用）。"""
+        return asyncio.run(self.asearch(query, **kw))
+
     def responses_create(
         self,
         *,
@@ -197,14 +229,13 @@ class LLMClient:
         json_format: bool = False,
         timeout: float | None = None,
     ) -> dict:
-        """Responses API（内置 web_search 工具，服务端执行；2026-08 官方文档）。
+        """Responses API 采样（2026-10 起不再承担搜索：搜索走 `asearch`/`search`）。
 
-        POST {base_url}/v1/responses（OpenAI 兼容惯例路径）；timeout 缺省 120s
-        （服务端搜索慢于普通 chat）；重试/退避与 chat 同机制；output 中无
-        output_text/message 条目视为截断签名，重试时倍增 max_output_tokens
-        （4096→8192→16384 封顶）。返回完整响应 JSON（output items 由调用方解析）。
-        注：8-13 试点实测最终答案为 type=\"message\"（phase=\"final_answer\"）条目，
-        而非顶层 output_text。"""
+        POST {base_url}/v1/responses（OpenAI 兼容惯例路径）；timeout 缺省 120s；
+        重试/退避与 chat 同机制；output 中无 output_text/message 条目视为截断签名，
+        重试时倍增 max_output_tokens（4096→8192→16384 封顶）。返回完整响应 JSON
+        （output items 由调用方解析）。注：8-13 试点实测最终答案为 type=\"message\"
+        （phase=\"final_answer\"）条目，而非顶层 output_text。"""
         return asyncio.run(
             self.aresponses_create(
                 input=input,
@@ -264,7 +295,5 @@ class LLMClient:
                 return False
             return True
 
-        async with httpx.AsyncClient(
-            transport=self._transport, timeout=timeout or 120.0
-        ) as client:
+        async with httpx.AsyncClient(transport=self._transport, timeout=timeout or 120.0) as client:
             return await _post_with_retry(client, url, payload, headers, self.max_retries, _check)

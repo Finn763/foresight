@@ -273,7 +273,7 @@ class LLM:
             raise RuntimeError("缺少 LLM API key（检查 .env 或 --env-file）")
         self.api_key = api_key
         self.base_url = base_url.rstrip("/") or "https://api.deepseek.com"
-        self.model = model or "deepseek-v4-flash"
+        self.model = model or "deepseek-flash"
 
     def chat_json(self, prompt: str, *, temperature: float, max_tokens: int = 8192) -> dict:
         url = f"{self.base_url}/v1/chat/completions"
@@ -500,7 +500,7 @@ def main() -> int:
     os_env = __import__("os").environ
     api_key = os_env.get("DEEPSEEK_API_KEY") or env.get("DEEPSEEK_API_KEY", "")
     base_url = os_env.get("DEEPSEEK_BASE_URL") or env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model = os_env.get("DEEPSEEK_MODEL") or env.get("DEEPSEEK_MODEL", "deepseek-chat")
+    model = os_env.get("DEEPSEEK_MODEL") or env.get("DEEPSEEK_MODEL", "deepseek-flash")
 
     print(f"[1/5] 扫新闻（48h 窗口，{len(NEWS_SOURCES)} 个源）...")
     with httpx.Client(follow_redirects=True) as http:

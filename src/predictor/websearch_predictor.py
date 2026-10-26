@@ -1,13 +1,15 @@
-"""原生 web_search 预测器（2026-08-13 用户拍板：预测侧加 LLM 原生搜索）。
+"""搜索增强预测器（2026-08-13 用户拍板：预测侧加 LLM 原生搜索）。
 
-与 B 类 LLM 揭晓器同构：Responses API 服务端 web_search → 概率+引用，
-替代 Halawi 五步中「搜索词生成→外部检索→相关性过滤→摘要」四步。
+2026-10 起重构：DeepSeek 的搜索改成独立接口 `/v1/tools/search`（见
+`predictor.llm.evidence`），旧路径（Responses API 服务端 web_search）已不再执行
+搜索，护栏因此全灭（2026-09-09 → 10-26 零预测）。现流程：Search 拉证据 →
+证据块注入 instructions → Responses API 只做采样 → 引用必须落在检索结果 URL 内。
 方案 A 统计基线照常注入 instructions（【统计基线】/【历史数据上下文】块）。
 
-防泄漏红线：回测/历史题禁用本模块——服务端搜索会搜到未来信息。
+防泄漏红线：回测/历史题禁用本模块——在线搜索会搜到未来信息。
 classic 管线（pipeline.run_prediction）保留：回测、历史文档溯源、GDELT 离线。
-护栏：任一采样引用空 → no_evidence 拒绝；概率非法/调用失败 → 该采样作废；
-全部采样失败 → None（evolution_log 记 prediction_skipped）。
+护栏：引用为空或不在检索结果内 → no_evidence 拒绝；概率非法/搜索或调用失败 →
+该采样作废；全部采样失败 → None（evolution_log 记 prediction_skipped）。
 """
 
 import asyncio
@@ -22,12 +24,19 @@ from predictor.calibration.calibrate import (
     load_calibrator,
 )
 from predictor.calibration.isotonic import IsotonicCalibrator
+from predictor.llm.evidence import asearch_evidence
 from predictor.pipeline import Prediction
 
+
+class _Unset:
+    """calibrator 默认值哨兵（None = 显式不校准，_UNSET = 加载默认校准器）。"""
+
+
+_UNSET = _Unset()
+
 _FORECAST_INSTRUCTIONS = (
-    "你是概率预测员。用 web_search 工具检索最新证据，估计事件在截止时间前发生的概率。\n"
     "规则：\n"
-    "1. 必须先搜索（服务端会执行）；citations 必须真实来自搜索结果 URL，禁止编造。\n"
+    "1. citations 只能取【检索结果】列出的 URL，禁止编造或引用未列出的地址。\n"
     "2. 概率是主观置信度 0-1（0=绝不可能，1=必然），推理要具体引用证据。\n"
     '3. 输出 JSON：{{"probability": 0.0-1.0, "rationale": "推理理由", '
     '"citations": ["url", ...]}}\n'
@@ -36,6 +45,7 @@ _FORECAST_INSTRUCTIONS = (
     "揭晓时间：{closes_iso}\n当前时刻：{now_iso}"
 )
 
+
 def _baseline_block(baseline) -> str:
     if not baseline:
         return ""
@@ -43,6 +53,7 @@ def _baseline_block(baseline) -> str:
         return "\n【统计基线】" + json.dumps(baseline, ensure_ascii=False)
     except (TypeError, ValueError):
         return "\n【统计基线】" + str(baseline)[:2000]
+
 
 def _extract_text(raw: dict) -> str | None:
     last_msg_text = None
@@ -64,9 +75,12 @@ def _extract_text(raw: dict) -> str | None:
         if item.get("type") == "output_text":
             content = item.get("content")
             if isinstance(content, list):
-                content = content[0].get("text") if content and isinstance(content[0], dict) else None
+                content = (
+                    content[0].get("text") if content and isinstance(content[0], dict) else None
+                )
             return content
     return None
+
 
 def _extract_citations(raw: dict, verdict: dict) -> list[str]:
     cites = verdict.get("citations") or []
@@ -95,14 +109,25 @@ def _extract_citations(raw: dict, verdict: dict) -> list[str]:
                 all_urls.append(str(u))
     return list(dict.fromkeys(all_urls))
 
-def _build_instructions(title, closes_at, now, baseline, historical_context: str) -> str:
-    instructions = _FORECAST_INSTRUCTIONS.format(title=title, closes_iso=closes_at.isoformat(timespec="seconds"), now_iso=now.isoformat(timespec="seconds"))
+
+def _build_instructions(
+    title, closes_at, now, baseline, historical_context: str, evidence: str = ""
+) -> str:
+    instructions = _FORECAST_INSTRUCTIONS.format(
+        title=title,
+        closes_iso=closes_at.isoformat(timespec="seconds"),
+        now_iso=now.isoformat(timespec="seconds"),
+    )
     instructions += _baseline_block(baseline)
     if historical_context:
         instructions += "\n【历史数据上下文】" + str(historical_context)[:4000]
+    if evidence:
+        instructions += "\n" + evidence
     return instructions
 
-def _parse_sample(raw: dict) -> dict:
+
+def _parse_sample(raw: dict, allowed_urls=()) -> dict:
+    """解析采样；引用白名单过滤（allowed_urls = 本次检索结果 URL 集）。"""
     text = _extract_text(raw)
     verdict = json.loads(text or "{}")
     prob = verdict.get("probability")
@@ -111,35 +136,69 @@ def _parse_sample(raw: dict) -> dict:
     prob = float(prob)
     if not (0.0 <= prob <= 1.0):
         raise ValueError(f"probability 越界: {prob!r}")
-    if not any(item.get("type") == "web_search_call" for item in raw.get("output", [])):
-        raise ValueError("web_search_call 条目缺失（搜索未发生，引用不可信）")
-    return {"probability": prob, "rationale": str(verdict.get("rationale") or "")[:2000], "citations": _extract_citations(raw, verdict)}
+    allowed = set(allowed_urls)
+    citations = list(dict.fromkeys(u for u in _extract_citations(raw, verdict) if u in allowed))
+    return {
+        "probability": prob,
+        "rationale": str(verdict.get("rationale") or "")[:2000],
+        "citations": citations,
+    }
 
-async def _asample(title: str, closes_at: datetime, now: datetime, client, baseline, historical_context: str) -> dict:
+
+async def _asample(
+    title: str, closes_at: datetime, now: datetime, client, baseline, historical_context: str
+) -> dict:
+    evidence, urls = await asearch_evidence(client, title, ori_question=title, count=8)
+    if not urls:
+        raise ValueError("搜索无结果（证据缺失）")
     raw = await client.aresponses_create(
-        input="请检索证据并预测该事件发生的概率。输出 JSON：{\"probability\": 0-1, \"rationale\": \"\", \"citations\": []}",
-        instructions=_build_instructions(title, closes_at, now, baseline, historical_context),
-        tools=[{"type": "web_search"}],
-        tool_choice={"type": "web_search"},
+        input='根据给定检索结果预测该事件发生的概率。输出 JSON：{"probability": 0-1, "rationale": "", "citations": []}',
+        instructions=_build_instructions(
+            title, closes_at, now, baseline, historical_context, evidence
+        ),
+        tools=[],
+        tool_choice="none",
         temperature=0.5,
         json_format=True,
     )
-    return _parse_sample(raw)
+    return _parse_sample(raw, urls)
 
-def _sample(title: str, closes_at: datetime, now: datetime, client, baseline, historical_context: str) -> dict:
+
+def _sample(
+    title: str, closes_at: datetime, now: datetime, client, baseline, historical_context: str
+) -> dict:
     # ponytail: shim kept for test compat, async path is canonical
     return asyncio.run(_asample(title, closes_at, now, client, baseline, historical_context))
 
-def _report(title: str, prob: float, rationale: str, citations: list[str], probs: list[float], baseline) -> str:
-    lines = [f"# 预测报告：{title}", "", f"**结论概率：{prob:.0%}**（LLM 原生搜索 {len(probs)} 次采样）", "", f"**推理：** {rationale}", "", "## 依据（服务端搜索引用）", ""]
+
+def _report(
+    title: str, prob: float, rationale: str, citations: list[str], probs: list[float], baseline
+) -> str:
+    lines = [
+        f"# 预测报告：{title}",
+        "",
+        f"**结论概率：{prob:.0%}**（DeepSeek 搜索 + LLM {len(probs)} 次采样）",
+        "",
+        f"**推理：** {rationale}",
+        "",
+        "## 依据（DeepSeek 搜索结果）",
+        "",
+    ]
     for u in citations:
         lines.append(f"- [来源]({u})")
     if baseline and isinstance(baseline, dict) and baseline.get("base_rate") is not None:
-        lines += ["", f"**统计基线：** {baseline['base_rate']:.0%} （{baseline.get('method', '历史统计')}）"]
+        lines += [
+            "",
+            f"**统计基线：** {baseline['base_rate']:.0%} （{baseline.get('method', '历史统计')}）",
+        ]
     if len(probs) > 1:
-        lines += ["", f"**模型分歧：** {min(probs):.0%} ~ {max(probs):.0%}（{len(probs)} 次采样，均值 {statistics.mean(probs):.0%}）"]
+        lines += [
+            "",
+            f"**模型分歧：** {min(probs):.0%} ~ {max(probs):.0%}（{len(probs)} 次采样，均值 {statistics.mean(probs):.0%}）",
+        ]
     lines += ["", "> 本预测基于揭晓前可得公开信息；概率非事实陈述。"]
     return "\n".join(lines)
+
 
 def websearch_predict(
     question_id: int,
@@ -151,12 +210,16 @@ def websearch_predict(
     baseline=None,
     historical_context: str = "",
     n_samples: int = 3,
-    calibrator: IsotonicCalibrator | None = ...,
+    calibrator: IsotonicCalibrator | None | _Unset = _UNSET,
 ) -> Prediction | None:
-    if calibrator is ...:
+    if isinstance(calibrator, _Unset):
         calibrator = load_calibrator(DEFAULT_CALIBRATOR_PATH)
     try:
-        print(f"[predict] 序列拉取阶段结束，开始 {n_samples} 路并发 LLM 采样", file=sys.stderr, flush=True)
+        print(
+            f"[predict] 序列拉取阶段结束，开始 {n_samples} 路并发 LLM 采样",
+            file=sys.stderr,
+            flush=True,
+        )
     except Exception:
         pass
 
@@ -165,7 +228,9 @@ def websearch_predict(
             s = await _asample(title, closes_at, now, client, baseline, historical_context)
         except Exception:
             try:
-                print(f"[predict] 采样 {i + 1}/{n_samples} 失败（作废）", file=sys.stderr, flush=True)
+                print(
+                    f"[predict] 采样 {i + 1}/{n_samples} 失败（作废）", file=sys.stderr, flush=True
+                )
             except Exception:
                 pass
             return None
@@ -183,7 +248,13 @@ def websearch_predict(
     if not samples:
         if storage is not None:
             try:
-                storage.log_evolution("prediction_skipped", json.dumps({"qid": question_id, "detail": "websearch all samples failed"}, ensure_ascii=False))
+                storage.log_evolution(
+                    "prediction_skipped",
+                    json.dumps(
+                        {"qid": question_id, "detail": "websearch all samples failed"},
+                        ensure_ascii=False,
+                    ),
+                )
             except Exception:
                 pass
         return None
@@ -191,7 +262,16 @@ def websearch_predict(
     if empty:
         if storage is not None:
             try:
-                storage.log_evolution("prediction_skipped", json.dumps({"qid": question_id, "detail": f"no_evidence: {len(empty)}/{len(samples)} 采样引用为空"}, ensure_ascii=False))
+                storage.log_evolution(
+                    "prediction_skipped",
+                    json.dumps(
+                        {
+                            "qid": question_id,
+                            "detail": f"no_evidence: {len(empty)}/{len(samples)} 采样引用为空",
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
             except Exception:
                 pass
         return None
@@ -202,33 +282,84 @@ def websearch_predict(
     evidence_ids = []
     for u in citations:
         try:
-            evidence_ids.append(storage.add_document(question_id, source="llm_websearch", url=u, title=u[:200], content="", published_at=None))
+            evidence_ids.append(
+                storage.add_document(
+                    question_id,
+                    source="llm_websearch",
+                    url=u,
+                    title=u[:200],
+                    content="",
+                    published_at=None,
+                )
+            )
         except Exception:
             continue
     if not evidence_ids:
         if storage is not None:
             try:
-                storage.log_evolution("prediction_skipped", json.dumps({"qid": question_id, "detail": "evidence write failed (引用无法落库)"}, ensure_ascii=False))
+                storage.log_evolution(
+                    "prediction_skipped",
+                    json.dumps(
+                        {"qid": question_id, "detail": "evidence write failed (引用无法落库)"},
+                        ensure_ascii=False,
+                    ),
+                )
             except Exception:
                 pass
         return None
     rationale = min(samples, key=lambda s: abs(s["probability"] - mean_prob))["rationale"]
-    pid = storage.add_prediction(question_id, prob, evidence_ids=evidence_ids, model_runs={"deepseek-flash-websearch": probs}, arm="websearch")
-    return Prediction(id=pid, question_id=question_id, probability=prob, rationale=rationale, evidence_ids=evidence_ids, model_runs={"deepseek-flash-websearch": probs}, report_md=_report(title, prob, rationale, citations, probs, baseline))
+    pid = storage.add_prediction(
+        question_id,
+        prob,
+        evidence_ids=evidence_ids,
+        model_runs={"deepseek-flash-websearch": probs},
+        arm="websearch",
+    )
+    return Prediction(
+        id=pid,
+        question_id=question_id,
+        probability=prob,
+        rationale=rationale,
+        evidence_ids=evidence_ids,
+        model_runs={"deepseek-flash-websearch": probs},
+        report_md=_report(title, prob, rationale, citations, probs, baseline),
+    )
+
 
 def _load_baseline(title: str, now: datetime, closes_at: datetime):
     try:
         from predictor.stats.baselines import compute_baseline
         from predictor.stats.historical import build_series_context, fetch_series_map
+
         sm = fetch_series_map(now=now)
-        return compute_baseline(title, sm, now=now, closes_at=closes_at), build_series_context(sm, now=now)
+        return compute_baseline(title, sm, now=now, closes_at=closes_at), build_series_context(
+            sm, now=now
+        )
     except Exception:
         return None, ""
 
-def predict_with_websearch(question_id: int, storage, client, now: datetime, *, calibrator: IsotonicCalibrator | None = ...) -> Prediction | None:
+
+def predict_with_websearch(
+    question_id: int,
+    storage,
+    client,
+    now: datetime,
+    *,
+    calibrator: IsotonicCalibrator | None | _Unset = _UNSET,
+) -> Prediction | None:
     try:
         q = storage.get_question(question_id)
     except KeyError:
         return None
     baseline, historical_context = _load_baseline(q.title, now, q.closes_at)
-    return websearch_predict(question_id, q.title, q.closes_at, now, client, storage, baseline=baseline, historical_context=historical_context, calibrator=calibrator)
+    return websearch_predict(
+        question_id,
+        q.title,
+        q.closes_at,
+        now,
+        client,
+        storage,
+        baseline=baseline,
+        historical_context=historical_context,
+        calibrator=calibrator,
+    )

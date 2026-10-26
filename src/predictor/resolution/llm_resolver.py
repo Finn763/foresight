@@ -1,8 +1,13 @@
-"""B 类 LLM 揭晓器：Responses API 内置 web_search 搜证据 → 双采样判定 + 四护栏。
+"""B 类 LLM 揭晓器：DeepSeek Search 拉证据 → 双采样判定 + 四护栏。
 
-判定依据 = 题目标题文本（B spec 空壳 `{"class": "B"}` 无需回填）；与 MarketResolver
-同构接口，成功返回 3-tuple（extra 携带 confidence/citations，由 auto_resolve 合并进
-resolution_ok detail 供时间线审计）。
+2026-10 起搜索走独立接口 `/v1/tools/search`（见 `predictor.llm.evidence`）：旧的
+Responses API 服务端 web_search 已不再执行搜索，导致 100% 采样被
+`web_search_call` 护栏判死（2026-09 → 10 揭晓全灭）。现流程：search → 证据块注入
+instructions → Responses API 只做判定 → 引用必须落在本次检索结果 URL 内。
+
+判定依据 = 题目标题文本 + 检索证据（B spec 空壳 `{"class": "B"}` 无需回填）；与
+MarketResolver 同构接口，成功返回 3-tuple（extra 携带 confidence/citations，由
+auto_resolve 合并进 resolution_ok detail 供时间线审计）。
 护栏：no_evidence（无搜索结果/无引用）/ low_confidence（任一采样 <0.7）/
 disagreement（双采样不一致）/ api_error（调用或解析失败）→ None + llm_resolve_failed
 事件（storage 为 None 时静默跳过，试点脚本用）。
@@ -12,13 +17,14 @@ import json
 from datetime import datetime, timedelta
 
 from predictor.llm.client import LLMError
+from predictor.llm.evidence import search_evidence
 
 _JUDGE_INSTRUCTIONS = (
-    "你是预测判定员。根据题目与搜索工具返回的证据，判定该事件在题目给定的时间窗口内是否成立。\n"
+    "你是预测判定员。根据题目与给定【检索结果】证据，判定该事件在题目给定的时间窗口内是否成立。\n"
     "规则：\n"
-    "1. 只依据搜索返回的引用证据判定；题目问的是事件在【截止时间】前是否发生/成立，"
+    "1. 只依据【检索结果】里的证据判定；题目问的是事件在【截止时间】前是否发生/成立，"
     "禁止用当前状态代替当时状态（如'未来 7 天内突破 X'须判定截止前是否曾突破）。\n"
-    "2. citations 必须真实来自搜索结果的 URL，禁止编造。\n"
+    "2. citations 只能取【检索结果】列出的 URL，禁止编造或引用未列出的地址。\n"
     '3. 输出 JSON：{{"outcome": true/false, "confidence": 0.0-1.0, '
     '"citations": ["url", ...]}}\n'
     "outcome=true 表示事件成立（题目答案为是）；confidence 是你对判定的把握度。\n"
@@ -64,16 +70,22 @@ class LLMResolver:
         return (bool(s1["outcome"]), "llm_websearch", {"confidence": conf, "citations": citations})
 
     def _judge(self, question, now) -> dict:
-        instructions = _JUDGE_INSTRUCTIONS.format(
-            title=question.title,
-            closes_iso=question.closes_at.isoformat(timespec="seconds"),
-            now_iso=now.isoformat(timespec="seconds"),
+        evidence, urls = search_evidence(self._client, question.title, ori_question=question.title)
+        if not urls:
+            raise ValueError("搜索无结果（证据缺失）")
+        instructions = (
+            _JUDGE_INSTRUCTIONS.format(
+                title=question.title,
+                closes_iso=question.closes_at.isoformat(timespec="seconds"),
+                now_iso=now.isoformat(timespec="seconds"),
+            )
+            + evidence
         )
         raw = self._client.responses_create(
-            input="请判定：该事件在截止时间前是否成立？输出 JSON：{\"outcome\": true/false, \"confidence\": 0-1, \"citations\": []}",
+            input='请判定：该事件在截止时间前是否成立？输出 JSON：{"outcome": true/false, "confidence": 0-1, "citations": []}',
             instructions=instructions,
-            tools=[{"type": "web_search"}],
-            tool_choice={"type": "web_search"},
+            tools=[],
+            tool_choice="none",
             temperature=0.3,
             json_format=True,
         )
@@ -141,6 +153,8 @@ class LLMResolver:
                 u = action.get("url")
                 if u and str(u) not in citations:
                     citations.append(str(u))
+        allowed = set(urls)
+        citations = [u for u in citations if u in allowed]
         raw_outcome = verdict.get("outcome")
         if type(raw_outcome) is not bool:
             raise ValueError(f"outcome 非布尔: {raw_outcome!r}")  # 缺失/字符串/None 一律拒
@@ -148,9 +162,6 @@ class LLMResolver:
             confidence = float(verdict.get("confidence"))
         except (TypeError, ValueError):
             raise ValueError(f"confidence 非法: {verdict.get('confidence')!r}")
-        if not any(item.get("type") == "web_search_call" for item in raw.get("output", [])):
-            # M-2：搜索从未发生则引用必为幻觉（spec 4.2④ 后半句的可实现代理）→ api_error
-            raise ValueError("web_search_call 条目缺失（搜索未发生，引用不可信）")
         return {
             "outcome": raw_outcome,
             "confidence": confidence,
@@ -160,7 +171,7 @@ class LLMResolver:
     def _guard(self, s1, s2):
         if not s1["citations"] or not s2["citations"]:
             # 任一采样无引用即证据不足（引用强制是每题采样的门槛，spec 4.2④）
-            return ("no_evidence", "web_search 无结果或引用为空")
+            return ("no_evidence", "检索无结果或引用为空/引用不在检索结果内")
         if s1["confidence"] < _CONFIDENCE_FLOOR or s2["confidence"] < _CONFIDENCE_FLOOR:
             return (
                 "low_confidence",

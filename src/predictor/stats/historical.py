@@ -10,13 +10,16 @@
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+
+from predictor.timeutil import CN_TZ
 
 SERIES = {
     "sp500": {"symbol": "^GSPC", "name": "标普500指数", "unit": "点", "fred": None},
@@ -59,7 +62,6 @@ CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
 EIA_URL = "https://api.eia.gov/v2/"
 START_TS = 1451606400  # 2016-01-01 UTC
-_EPOCH = datetime(1970, 1, 1)
 
 # 让 fetch 可注入 transport（测试用）
 _transport: httpx.BaseTransport | None = None
@@ -125,7 +127,11 @@ def fetch_eia_series(
 
 
 def _to_ts(dt: datetime) -> int:
-    return int((dt - _EPOCH).total_seconds())
+    # naive 按北京墙钟解释（项目全局约定）；旧实现减 naive epoch 把本地时间当 UTC，
+    # 回测/实盘窗口整体偏 +8h。aware 直接取时间戳。
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=CN_TZ)
+    return int(dt.timestamp())
 
 
 def fetch_fred_series(
@@ -166,11 +172,17 @@ def fetch_fred_series(
 def fetch_series(
     symbol: str, start_ts: int = START_TS, end_ts: int | None = None, interval: str = "1d"
 ) -> list[dict[str, Any]]:
-    """拉日线 → [{date, open, close, high, low}] 升序。网络失败返回 []（调用方降级）。"""
+    """拉日线 → [{date, open, close, high, low}] 升序。网络失败返回 []（调用方降级）。
+
+    防泄漏：Yahoo 日线的 timestamp 是开盘时刻，period2=盘中仍会返回当日**最终收盘**
+    （实测 ^GSPC period2=14:06Z 已含收盘 7748.5）。故剔除 end 当日及更晚的 bar——
+    预测时点当天尚未收盘，不能把未来收盘喂给模型/基线。
+    """
     try:
+        effective_end = end_ts if end_ts is not None else _to_ts(datetime.now())
         params = {
             "period1": start_ts,
-            "period2": end_ts or _to_ts(datetime.now()),
+            "period2": effective_end,
             "interval": interval,
         }
         with httpx.Client(
@@ -192,16 +204,15 @@ def fetch_series(
                 continue
             out.append(
                 {
-                    "date": datetime.fromtimestamp(t, __import__("datetime").timezone.utc).strftime(
-                        "%Y-%m-%d"
-                    ),
+                    "date": datetime.fromtimestamp(t, UTC).strftime("%Y-%m-%d"),
                     "open": opens[i] if opens and i < len(opens) else c,
                     "close": c,
                     "high": highs[i] if highs and i < len(highs) else c,
                     "low": lows[i] if lows and i < len(lows) else c,
                 }
             )
-        return out
+        cutoff = datetime.fromtimestamp(effective_end, UTC).strftime("%Y-%m-%d")
+        return [row for row in out if row["date"] < cutoff]
     except (httpx.HTTPError, ValueError, KeyError, TypeError, IndexError):
         return []
 
@@ -238,6 +249,8 @@ def fetch_series_map(now: datetime | None = None) -> dict[str, list[dict[str, An
       跨日自动失效；拉取失败（任一序列抛异常，或全部序列为空）不写缓存，
       下次调用自动重试。cache_clear() 手动清缓存。
     """
+    if os.environ.get("FORESIGHT_OFFLINE") == "1":
+        return {}  # 测试/CI 隔离：禁止真实行情网络（Yahoo/FRED/EIA）
     now = now or datetime.now()
     cache_key = now.date().isoformat()
     with _series_cache_lock:

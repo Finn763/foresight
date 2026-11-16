@@ -5,9 +5,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from predictor.calibration.calibrate import apply_calibrator
+from predictor.calibration.calibrate import (
+    DEFAULT_CALIBRATOR_PATH,
+    apply_calibrator,
+    load_calibrator,
+)
 from predictor.calibration.isotonic import IsotonicCalibrator
-from predictor.calibration.postprocess import extremize
+from predictor.calibration.postprocess import clamp, extremize
 from predictor.inference.ensemble import ensemble
 from predictor.inference.filter import filter_relevant
 from predictor.inference.forecast import ForecastResult, forecast
@@ -15,6 +19,8 @@ from predictor.inference.retrieve import retrieve_and_store
 from predictor.inference.search_terms import generate_search_terms
 from predictor.inference.summarize import summarize_documents
 from predictor.report.generator import generate_report
+
+_UNSET = object()
 
 
 @dataclass
@@ -40,12 +46,15 @@ def run_prediction(
     arm: str = "baseline",
     arm_group: int | None = None,
     alpha: float | None = None,
-    calibrator: IsotonicCalibrator | None = None,
+    calibrator: IsotonicCalibrator | None | object = _UNSET,
 ) -> Prediction | None:
     try:
         q = storage.get_question(question_id)
     except KeyError:
         return None
+    if calibrator is _UNSET:
+        # 生产调用点默认加载落盘校准器；回测/对照实验必须显式传 None（避免未来信息）
+        calibrator = load_calibrator(DEFAULT_CALIBRATOR_PATH)
     now = now or datetime.now()
     historical_context = ""
     baseline = None
@@ -71,10 +80,11 @@ def run_prediction(
         return None
     relevant = filter_relevant(q.title, docs, client, top_k=5)
     summaries = summarize_documents(relevant, client)
+    model_name = getattr(client, "model", None) or "unknown"
     runs: list[ForecastResult] = []
     for i in range(n_samples):
         try:
-            runs.append(forecast(q.title, summaries, client, prior=prior, model=client.model if hasattr(client, "model") else "deepseek-flash", historical_context=historical_context, baseline=baseline))
+            runs.append(forecast(q.title, summaries, client, prior=prior, model=model_name, historical_context=historical_context, baseline=baseline))
         except ValueError:
             continue
     if not runs:
@@ -84,13 +94,23 @@ def run_prediction(
             pass
         return None
     # ponytail: single-model path trimmed → equal-weight ensemble (weights_from_model_stats deleted)
-    prob = ensemble(runs)
-    prob = extremize(prob, alpha=alpha if alpha is not None else 0.2)
-    prob = apply_calibrator(prob, calibrator)
+    raw_prob = extremize(ensemble(runs), alpha=alpha if alpha is not None else 0.2)
+    prob = clamp(apply_calibrator(raw_prob, calibrator))
     evidence_ids = [d.id for d in relevant if d.id is not None]
     if not evidence_ids:
         return None
     sample_probs = [r.probability for r in runs]
-    pid = storage.add_prediction(question_id, prob, evidence_ids=evidence_ids, model_runs={"deepseek-flash": sample_probs}, arm=arm, arm_group=arm_group)
-    report = generate_report(q.title, prob, runs[0].rationale, summaries, relevant, prior, runs=runs, baseline=baseline)
-    return Prediction(id=pid, question_id=question_id, probability=prob, rationale=runs[0].rationale, evidence_ids=evidence_ids, model_runs={"deepseek-flash": sample_probs}, report_md=report)
+    model_runs = {model_name: sample_probs}
+    # 报告/理由取最接近集成值的样本（不是 runs[0]）；websearch 路径同款。
+    chosen = min(runs, key=lambda r: abs(r.probability - raw_prob))
+    pid = storage.add_prediction(
+        question_id,
+        prob,
+        evidence_ids=evidence_ids,
+        model_runs=model_runs,
+        arm=arm,
+        arm_group=arm_group,
+        raw_probability=raw_prob,
+    )
+    report = generate_report(q.title, prob, chosen.rationale, summaries, relevant, prior, runs=runs, baseline=baseline)
+    return Prediction(id=pid, question_id=question_id, probability=prob, rationale=chosen.rationale, evidence_ids=evidence_ids, model_runs=model_runs, report_md=report)

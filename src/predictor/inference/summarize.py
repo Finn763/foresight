@@ -9,6 +9,7 @@ SUMMARIZE_PROMPT = '用 ≤80 字总结下面文档的要点，输出 JSON：{{"
 def _summarize_one(d: Document, client: Any) -> str:
     try:
         raw = client.chat(
+            None,
             [
                 {
                     "role": "user",

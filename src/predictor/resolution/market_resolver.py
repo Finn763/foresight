@@ -29,6 +29,18 @@ SYMBOL_MAP = {
 }
 
 
+# 阈值/创新高判定需要日线序列；主源是 sina 快照时回退到可拉日线的源。
+# （Yahoo 符号与题目标的同口径：COMEX 金 GC=F、布伦特 BZ=F、离岸人民币 CNH=X）
+_KLINE_FALLBACK = {
+    "gold": ("yahoo", "GC=F"),
+    "brent": ("yahoo", "BZ=F"),
+    "usdcnh": ("yahoo", "CNH=X"),
+    "spx": ("yahoo", "^GSPC"),
+    "dji": ("yahoo", "^DJI"),
+    "sh000001": ("yahoo", "000001.SS"),
+}
+
+
 class MarketResolver:
     """双源取价 → 一致性 → 分歧降级 / 备源挂时合理性兜底 → 条件判定 → None 降级。"""
 
@@ -79,6 +91,9 @@ class MarketResolver:
         cond = spec["condition"]
         if cond == "record_high":
             return self._resolve_record_high(question, spec)
+        if cond in ("gt_threshold", "lt_threshold") and self._fetch_kline is not None:
+            # 阈值题是「窗口内是否触及」：必须看窗口内 max/min，不能看窗口后单点快照。
+            return self._resolve_threshold(question, spec, cond)
         primary = (spec["source_primary"], spec.get("compare_symbol"))
         p_price = self._fetch(*primary)
         backup_provider = spec.get("source_backup")
@@ -103,6 +118,62 @@ class MarketResolver:
                 return None
             return (p_price > prev, primary[0])
         return None
+
+    def _window_dates(self, question) -> tuple:
+        """事件窗口的交易日边界：最后完整交易日 = closes 前一天（含北京清晨截止）。"""
+        lo = question.opens_at.date()
+        hi = question.closes_at.date() - timedelta(days=1)
+        return lo, max(lo, hi)
+
+    def _kline_source(self, spec) -> tuple[str, str] | None:
+        primary = spec.get("source_primary")
+        symbol = spec.get("compare_symbol")
+        if primary in ("tencent", "yahoo") and symbol:
+            return primary, symbol
+        return _KLINE_FALLBACK.get(spec.get("instrument"))
+
+    def _resolve_threshold(self, question, spec, cond: str) -> tuple[bool, str] | None:
+        """窗口内 max(gt)/min(lt) 与阈值比较；双源结论相反 → 降级；备源挂且贴边 → 降级。"""
+        source = self._kline_source(spec)
+        if source is None:
+            return None
+        try:
+            bars = self._fetch_kline(*source)
+        except Exception:
+            return None
+        verdict, margin = self._judge_threshold(bars, question, spec, cond)
+        if verdict is None:
+            return None
+        backup_provider = spec.get("source_backup")
+        backup_symbol = self._backup_symbol(spec)
+        if backup_provider in ("tencent", "yahoo") and backup_symbol:
+            try:
+                b_verdict, _ = self._judge_threshold(
+                    self._fetch_kline(backup_provider, backup_symbol), question, spec, cond
+                )
+                if b_verdict is not None and b_verdict != verdict:
+                    return None
+            except Exception:
+                if margin < self._record_margin:
+                    return None  # 备源挂 + 贴边 → 不猜
+        return (verdict, source[0])
+
+    def _judge_threshold(self, bars, question, spec, cond: str) -> tuple[bool | None, float]:
+        """bars: [(date, close)]。返回 (verdict, margin)；窗口未齐/数据缺失 → (None, 0)。"""
+        if not bars:
+            return None, 0.0
+        lo, hi = self._window_dates(question)
+        dates = [d for d, _ in bars]
+        if max(dates) < hi:
+            return None, 0.0  # 窗口数据未齐 → 宽限内重试
+        window = [c for d, c in bars if lo <= d <= hi]
+        value = float(spec["value"])
+        if not window or value <= 0:
+            return None, 0.0
+        extreme = max(window) if cond == "gt_threshold" else min(window)
+        if cond == "gt_threshold":
+            return extreme > value, extreme / value - 1.0
+        return extreme < value, 1.0 - extreme / value
 
     def _resolve_record_high(self, question, spec) -> tuple[bool, str] | None:
         """创新高判定（收盘价口径）：窗口内收盘 max > 窗口前历史最高收盘。
@@ -135,7 +206,7 @@ class MarketResolver:
 
     def _judge_record_high(self, bars, question) -> tuple[bool | None, float]:
         """bars: [(date, close)]。返回 (verdict, margin)；数据不足 → (None, 0)。"""
-        lo, hi = question.opens_at.date(), question.closes_at.date()
+        lo, hi = self._window_dates(question)
         if not bars:
             return None, 0.0
         dates = [d for d, _ in bars]

@@ -73,8 +73,8 @@ def test_probe_down_when_not_listening(monkeypatch):
 
 
 def test_launch_command_contract(monkeypatch, tmp_path):
-    """launch 的命令/环境契约：venv python + -E -X utf8、PYTHONPATH 移除、
-    PYTHONIOENCODING=utf-8、cwd=项目根、stdout/stderr 进独立服务日志。"""
+    """launch 的命令/环境契约：base 解释器 + sys.path 注入、-E -X utf8、
+    PYTHONPATH 移除、PYTHONIOENCODING=utf-8、cwd=项目根、日志进独立文件。"""
     captured = {}
 
     class FakePopen:
@@ -87,7 +87,15 @@ def test_launch_command_contract(monkeypatch, tmp_path):
 
     ed.launch()
 
-    assert captured["cmd"] == [str(ed.PY), "-E", "-X", "utf8", str(ed.SRV_SCRIPT)]
+    cmd = captured["cmd"]
+    assert cmd[0] == str(ed._base_python())
+    assert cmd[1:4] == ["-E", "-X", "utf8"]
+    assert cmd[4] == "-c"
+    bootstrap = cmd[5]
+    assert "site-packages" in bootstrap
+    assert repr(str(ed.ROOT / "src")) in bootstrap
+    assert "run_path" in bootstrap
+    assert repr(str(ed.SRV_SCRIPT)) in bootstrap
     kw = captured["kwargs"]
     assert "PYTHONPATH" not in kw["env"]
     assert kw["env"]["PYTHONIOENCODING"] == "utf-8"
@@ -96,3 +104,23 @@ def test_launch_command_contract(monkeypatch, tmp_path):
     assert kw["creationflags"] & 0x08000000  # CREATE_NO_WINDOW
     assert kw["creationflags"] & 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
     assert kw["stdin"] is not None or "stdin" in kw  # DEVNULL 已设
+
+
+def test_launch_falls_back_without_breakaway(monkeypatch, tmp_path):
+    """受限 Job 拒绝 CREATE_BREAKAWAY_FROM_JOB 时降级重试（否则 ensure 永久失败）。"""
+    calls = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            calls.append(kwargs["creationflags"])
+            if len(calls) == 1:
+                raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(ed, "_LOG", tmp_path / "web_server.log")
+    monkeypatch.setattr(ed.subprocess, "Popen", FakePopen)
+
+    ed.launch(["--port", "8899"])
+
+    assert len(calls) == 2
+    assert calls[0] & 0x01000000
+    assert not (calls[1] & 0x01000000)

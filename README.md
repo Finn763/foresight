@@ -48,9 +48,10 @@ foresight-engine "Will the Fed cut rates in September?" --closes 2026-09-17
 ```
 
 > The npm package ships the **Python engine CLI** under the command `foresight-engine`.
+> npm 0.3.1 (currently on the registry) still exposes it as `foresight`; the rename ships with 0.4.0.
 > The interactive agent shell (pi fork) is a separate install — see §2 below — and owns the bare `foresight` command.
 
-The npm installer fetches a prebuilt, self-contained binary for your platform (Windows x64, macOS x64/arm64, Linux x64) — the Python runtime and all dependencies are bundled inside, so no Python, uv, or package manager setup is required. To use your own API key, copy `.env.example` to `.env` and set `DEEPSEEK_API_KEY`, or set it as an environment variable.
+From 0.4.0, the npm installer fetches a prebuilt, self-contained binary for your platform (Windows x64, macOS x64/arm64, Linux x64) — the Python runtime and all dependencies are bundled inside, so no Python, uv, or package manager setup is required. To use your own API key, copy `.env.example` to `.env` and set `DEEPSEEK_API_KEY`, or set it as an environment variable.
 
 ### 1. Python engine
 

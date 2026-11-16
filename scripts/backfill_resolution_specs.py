@@ -69,31 +69,60 @@ def _match(title: str) -> tuple[str, dict, str] | None:
     if "创历史新高" in title or "创新高" in title:
         return "C", {"class": "C"}, "A 标普 record_high → P0 无该条件，C 人工占位 (P1)"
     # —— A 类行情（函数式匹配，阈值按题面提取）——
-    m = re.search(r"升破\s*([\d.]+)", title)
-    if m:
-        v = float(m.group(1))
-        return (
-            "A",
-            _a_spec(
-                "usdcnh",
-                condition="lt_threshold",
-                value=v,
-                compare_symbol="fx_susdcnh",
-                close_timezone="Asia/Shanghai",
-            ),
-            f"A 人民币兑美元 升破 {v} → lt_threshold",
-        )
+    # 原则：只有能确定「标的 × 方向 × 数值」才写 A 类 spec；任何模糊一律返回 None
+    # （保持人工），绝不填默认值/跨标的口径（旧实现会把「金价升破 4000」写成 USDCNH）。
+    def _num(raw: str) -> float:
+        return float(raw.replace(",", ""))
+
+    if any(k in title for k in ("人民币", "汇率", "美元兑")):
+        # 人民币兑美元升破 X → 人民币走强 → USDCNH 跌破 X（lt_threshold）
+        m = re.search(r"人民币兑美元[^，。]*?升破\s*([\d.]+)", title)
+        if m:
+            v = _num(m.group(1))
+            return (
+                "A",
+                _a_spec(
+                    "usdcnh",
+                    condition="lt_threshold",
+                    value=v,
+                    compare_symbol="fx_susdcnh",
+                    close_timezone="Asia/Shanghai",
+                ),
+                f"A 人民币兑美元升破 {v} → USDCNH lt_threshold",
+            )
+        # 美元兑人民币升破 X → USDCNH 升破 X（gt_threshold）
+        m = re.search(r"美元兑人民币[^，。]*?升破\s*([\d.]+)", title)
+        if m:
+            v = _num(m.group(1))
+            return (
+                "A",
+                _a_spec(
+                    "usdcnh",
+                    condition="gt_threshold",
+                    value=v,
+                    compare_symbol="fx_susdcnh",
+                    close_timezone="Asia/Shanghai",
+                ),
+                f"A 美元兑人民币升破 {v} → gt_threshold",
+            )
+        return None  # 汇率题但方向/口径不明 → 不猜
     if "比特币" in title:
-        m = re.search(r"突破\s*([\d.]+)\s*万", title)
-        v = float(m.group(1)) * 10000 if m else 150000.0
-        return (
-            "A",
-            _a_spec("btc", condition="gt_threshold", value=v, source_primary="coingecko"),
-            f"A 比特币 突破 {v:.0f} → gt_threshold",
-        )
-    m = re.search(r"突破\s*([\d.]+)\s*美元", title)
+        m = re.search(r"(?:突破|高于|超过|站上)\s*([\d,.]+)\s*(万)?\s*美元", title)
+        cond, verb = "gt_threshold", "高于"
+        if not m:
+            m = re.search(r"(?:跌至|跌破|低于|跌到)\s*([\d,.]+)\s*(万)?\s*美元", title)
+            cond, verb = "lt_threshold", "低于"
+        if m:
+            v = _num(m.group(1)) * (10000 if m.group(2) else 1)
+            return (
+                "A",
+                _a_spec("btc", condition=cond, value=v, source_primary="coingecko"),
+                f"A 比特币 {verb} {v:.0f} → {cond}",
+            )
+        return None  # 无数值/方向 → 不猜（旧实现默认 150000）
+    m = re.search(r"(?:升破|突破|站上|高于)\s*([\d,.]+)\s*美元", title)
     if m and "金价" in title:
-        v = float(m.group(1))
+        v = _num(m.group(1))
         return (
             "A",
             _a_spec(
@@ -105,17 +134,17 @@ def _match(title: str) -> tuple[str, dict, str] | None:
             ),
             f"A 金价 突破 {v:.0f} → gt_threshold",
         )
-    m = re.search(r"突破\s*([\d.]+)\s*美元/桶", title)
+    m = re.search(r"(?:升破|突破|站上|高于)\s*([\d,.]+)\s*美元/桶", title)
     if m:
-        v = float(m.group(1))
+        v = _num(m.group(1))
         return (
             "A",
             _a_spec("brent", condition="gt_threshold", value=v, compare_symbol="hf_OIL"),
             f"A 布伦特 突破 {v:.0f} → gt_threshold",
         )
-    m = re.search(r"站上\s*([\d.]+)\s*点", title)
-    if m:
-        v = float(m.group(1))
+    m = re.search(r"(?:升破|突破|站上)\s*([\d,.]+)\s*点", title)
+    if m and "标普" in title:
+        v = _num(m.group(1))
         return (
             "A",
             _a_spec(
@@ -142,23 +171,12 @@ def _match(title: str) -> tuple[str, dict, str] | None:
             ),
             "A 标普 收盘高于昨收 → gt_prev_close",
         )
+    # 非阈值金价/布伦特题：sina hf_ 昨收被 quotes 明确拒绝（无法自动判定），
+    # 写 gt_prev_close 只会永远 None；标 C 人工，不制造假 A 类。
     if "布伦特" in title:
-        return (
-            "A",
-            _a_spec("brent", condition="gt_prev_close", compare_symbol="hf_OIL"),
-            "A 布伦特 收盘高于昨收 → gt_prev_close",
-        )
+        return "C", {"class": "C"}, "C 布伦特非阈值题（hf_ 无昨收）→ 人工"
     if "金价" in title:
-        return (
-            "A",
-            _a_spec(
-                "gold",
-                condition="gt_prev_close",
-                compare_symbol="hf_GC",
-                close_timezone="America/New_York",
-            ),
-            "A 金价 收盘高于昨收 → gt_prev_close",
-        )
+        return "C", {"class": "C"}, "C 金价非阈值题（hf_ 无昨收）→ 人工"
     return None
 
 

@@ -28,14 +28,22 @@ sys.path.insert(0, str(ROOT))
 from predictor.config import Settings  # noqa: E402
 from predictor.data.storage import Storage  # noqa: E402
 from predictor.ops.lock import LockWaitTimeout, wait_acquire  # noqa: E402
+from predictor.timeutil import CN_TZ  # noqa: E402
 
 LOCK_WAIT_SECONDS = 600  # 08:45 入场，09:00 预测轮前必须结束；等不到锁即告警退出
 OBSERVE_IS_PUBLIC = False  # 观察期（2026-08-27 定）：新题不进对外榜单
 
 
 def _parse_dt(s: str) -> datetime:
-    """ISO 8601（含 +00:00）→ naive UTC（DuckDB TIMESTAMP 不接受 tzinfo）。"""
-    return datetime.fromisoformat(s).replace(tzinfo=None)
+    """ISO 8601（autopick 产出 UTC aware）→ 北京 naive（DB 全局约定）。
+
+    旧实现直接 strip tzinfo，把 UTC 墙钟当北京时间存 → 所有 autopick 题提前 8 小时
+    到期/揭晓（生产 #444 提前 3.5 小时永久判 True）。naive 输入按 UTC 解释。
+    """
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(CN_TZ).replace(tzinfo=None)
 
 
 def _event_key(spec) -> str:

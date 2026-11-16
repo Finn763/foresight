@@ -1,7 +1,8 @@
 """验证从 forecastbench-datasets 真实结构 JSON 解析出 BenchQuestion 列表。"""
 
-import httpx
 from pathlib import Path
+
+import httpx
 
 from predictor.data.benchmarks import BenchQuestion, fetch_forecastbench_questions
 

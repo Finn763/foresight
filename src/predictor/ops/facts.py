@@ -6,7 +6,7 @@ ops.lock.lock_state（与 acquire_lock 接管判定同源：GetExitCodeProcess S
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from predictor.ops import lock
@@ -25,14 +25,28 @@ def build_facts(st, now: datetime, *, lock_state: str | None = None) -> dict:
         for k in ("daily_predict", "evolve_predict", "evolve_resolve")
     }
     today_start = datetime.combine(now.date(), datetime.min.time())
+    # 揭晓轮只有 16:30 一条轨道，健康检查却在 09:35/16:40；16:40 时宽限（18:30）
+    # 未到，只能看到 pending。故额外回看昨日，供 assess 判断「上一个已过宽限的
+    # 揭晓窗口是否完成」，避免揭晓轮停摆隔天就再也无人告警。
+    lookback_start = today_start - timedelta(days=1)
+    last_resolve_started = None
+    last_resolve_completed = None
     for ev in st.list_events(types=["round_started", "round_completed"], limit=1000):
-        if ev["ts"] < today_start:
+        if ev["ts"] < lookback_start:
             break  # id 倒序：更早的事件不用再看
         try:
             key = json.loads(ev["detail"] or "{}").get("round")
         except Exception:
             continue
-        if key in rounds:
+        if key not in rounds:
+            continue
+        if key == "evolve_resolve":
+            day = ev["ts"].date()
+            if ev["event_type"] == "round_completed":
+                last_resolve_completed = max(last_resolve_completed or day, day)
+            else:
+                last_resolve_started = max(last_resolve_started or day, day)
+        elif ev["ts"] >= today_start:
             rounds[key]["completed" if ev["event_type"] == "round_completed" else "started"] = True
 
     backlog = st.ops_backlog(now)
@@ -62,6 +76,12 @@ def build_facts(st, now: datetime, *, lock_state: str | None = None) -> dict:
 
     return {
         "rounds": rounds,
+        "resolve_last_started_date": (
+            last_resolve_started.isoformat() if last_resolve_started else None
+        ),
+        "resolve_last_completed_date": (
+            last_resolve_completed.isoformat() if last_resolve_completed else None
+        ),
         "backlog": backlog,
         "storm": st.ops_storm(now),
         "lock": lock_state,

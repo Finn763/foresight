@@ -27,7 +27,7 @@ def test_probe_quotes_flags_failure(monkeypatch):
     assert out["ok"] is False and '"sina": false' in out["detail"]
 
 
-def test_probe_llm_calls_plain_chat(monkeypatch):
+def test_probe_llm_covers_chat_and_search(monkeypatch):
     calls = {}
 
     class FakeLLM:
@@ -39,12 +39,36 @@ def test_probe_llm_calls_plain_chat(monkeypatch):
             calls["max_tokens"] = kw.get("max_tokens")
             return "pong"
 
+        def search(self, query, **kw):
+            calls["query"] = query
+            return [{"title": "hit"}]
+
     monkeypatch.setattr(probes, "LLMClient", FakeLLM)
     out = probes._probe_llm()
     assert out["ok"] is True
     assert calls["max_tokens"] >= 512  # 推理模型 reasoning 会吃 token，防假阳
+    assert calls["query"]
     # 不用 json_mode（DeepSeek 要求 prompt 含 "json" 字样，8-13 实测 400）
     assert "response_format" not in calls
+
+
+def test_probe_llm_flags_search_failure(monkeypatch):
+    """搜索接口失效但 chat 正常时必须 ok=False（7 周停摆的假绿根因）。"""
+
+    class FakeLLM:
+        def __init__(self, **kw):
+            pass
+
+        def chat(self, *a, **kw):
+            return "pong"
+
+        def search(self, *a, **kw):
+            raise RuntimeError("search down")
+
+    monkeypatch.setattr(probes, "LLMClient", FakeLLM)
+    out = probes._probe_llm()
+    assert out["ok"] is False
+    assert "search down" in out["detail"]
 
 
 def test_probe_scheduler_parses_chinese_csv(monkeypatch):

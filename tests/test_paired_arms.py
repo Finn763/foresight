@@ -42,6 +42,14 @@ class _FakeSource:
         ]
 
 
+@pytest.fixture(autouse=True)
+def _offline_series(monkeypatch):
+    monkeypatch.setenv("FORESIGHT_OFFLINE", "1")
+    from predictor.stats.historical import cache_clear
+
+    cache_clear()
+
+
 def _make_env(tmp_path: Path):
     st = Storage(str(tmp_path / "a.db"))
     st.create_schema()
@@ -73,7 +81,8 @@ def test_arms_stored_with_group(tmp_path, patch_pipeline):
     st.add_document(qid, "fake", "http://x/1", "标题", "内容", published_at=datetime.now())
     client = _FakeClient([0.6, 0.6, 0.6, 0.7, 0.7, 0.7])
     pa = run_prediction(
-        qid, st, client, [_FakeSource()], now=datetime.now(), arm="baseline", arm_group=1
+        qid, st, client, [_FakeSource()], now=datetime.now(),
+        arm="baseline", arm_group=1, calibrator=None,
     )
     pb = run_prediction(
         qid,
@@ -84,6 +93,7 @@ def test_arms_stored_with_group(tmp_path, patch_pipeline):
         prior=0.6,
         arm="experiment",
         arm_group=1,
+        calibrator=None,
     )
     assert pa is not None and pb is not None
     rows = st._conn.execute(
@@ -104,7 +114,9 @@ def test_alpha_param_offsets_extremize(tmp_path, patch_pipeline):
     )
     st.add_document(qid, "fake", "http://x/2", "标题2", "内容2", published_at=datetime.now())
     client = _FakeClient([0.55, 0.55, 0.55])
-    p = run_prediction(qid, st, client, [_FakeSource()], now=datetime.now(), alpha=0.0)
+    p = run_prediction(
+        qid, st, client, [_FakeSource()], now=datetime.now(), alpha=0.0, calibrator=None
+    )
     assert abs(p.probability - 0.55) < 1e-6  # alpha=0 → 不外推
 
 

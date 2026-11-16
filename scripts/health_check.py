@@ -171,30 +171,39 @@ def _open_storage_with_retry(db_path: str, *, attempts: int = 6, delay: float = 
     raise last
 
 
-def collect(st, now: datetime, *, lock_state: str | None = None) -> tuple[list[str], dict]:
-    """收集告警条目：health.assess 的 error 项 + 24h 失败事件规则。
+def collect(
+    st, now: datetime, *, lock_state: str | None = None, refresh: bool = True
+) -> tuple[list[str], dict]:
+    """收集告警条目：health.assess 的 error 项 + 24h 失败事件规则 + 关键探针。
 
     lock_state 透传给 build_facts：health_check 持锁入场后锁文件已被自己重写为
     自身 pid（wait_acquire 接管），现场判定会误报 active——传入 "none" 跳过读取。
+    refresh=False 时读进程内缓存（测试用，禁真实网络）。
     """
     from predictor.ops.facts import build_facts
     from predictor.ops.health import assess
     from predictor.ops.probes import get_probes, refresh_probes
 
-    try:
-        refresh_probes()
-    except Exception:
-        pass
+    if refresh:
+        try:
+            refresh_probes()
+        except Exception:
+            pass
     facts = build_facts(st, now, lock_state=lock_state)
     facts["probes"] = get_probes()
     report = assess(facts, now)
 
     alerts = []
     for c in report["checks"]:
-        # 探针（probe_*）是真实网络探测，环境敏感，只在 web 面板人工触发时参考；
-        # 自检只告确定性事实（轮次/事件/积压/锁）。key 失效由 401 事件规则兜底。
+        # 探针（probe_*）是真实网络探测，环境敏感；行情源偶发单边失败不告警。
+        # 但 LLM 与任务计划器的失败会直接让预测/揭晓/守护失能，必须进告警集。
         if c["status"] == "error" and not c["key"].startswith("probe_"):
             alerts.append(c["summary"])
+    probes = facts.get("probes") or {}
+    for key, label in (("scheduler", "任务计划器"), ("llm", "LLM 服务")):
+        p = probes.get(key)
+        if isinstance(p, dict) and p.get("ok") is False:
+            alerts.append(f"{label}：{p.get('detail') or '异常'}")
 
     # 补充 24h 事件规则（跨日：昨天 16:30 揭晓失败由今早 9:35 检出）
     try:
@@ -269,6 +278,11 @@ def main(argv=None) -> int:
     ap.add_argument("--now", default=None, help="测试注入 YYYY-MM-DDTHH:MM:SS")
     ap.add_argument("--no-notify", action="store_true", help="只写文件不弹 toast（测试）")
     ap.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="跳过真实网络探测（行情/LLM/任务器），读进程内缓存；测试用",
+    )
+    ap.add_argument(
         "--lock-wait",
         type=int,
         default=2700,
@@ -305,7 +319,9 @@ def main(argv=None) -> int:
         ):
             st = _open_storage_with_retry(db_path)
             st.create_schema()
-            alerts, report = collect(st, now, lock_state="none")
+            alerts, report = collect(
+                st, now, lock_state="none", refresh=not args.no_probe
+            )
             st.close()  # 释放 rw 连接，业务断言改走 read_only（同进程 rw+ro 并存会被 DuckDB 拒绝）
             alerts += _prediction_gap_assertion(db_path, now)
     except LockWaitTimeout as e:

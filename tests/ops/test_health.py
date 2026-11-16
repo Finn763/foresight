@@ -21,6 +21,8 @@ def _facts(**kw):
             "manual_pending": 0,
             "manual_oldest_days": None,
         },
+        "resolve_last_started_date": "2026-08-12",
+        "resolve_last_completed_date": "2026-08-12",
         "storm": 0,
         "lock": "none",
         "scoreboard_date": "2026-08-13",
@@ -78,6 +80,25 @@ def test_resolve_missing_after_grace_is_error():
     f["rounds"]["daily_predict"] = {"started": True, "completed": True}
     f["rounds"]["evolve_predict"] = {"started": True, "completed": True}
     out = assess(f, datetime(2026, 8, 13, 19, 0))
+    assert _check(out["checks"], "resolve")["status"] == "error"
+
+
+def test_resolve_pending_morning_but_yesterday_missing_is_error():
+    """09:35 晨检：今日未到宽限，但昨日揭晓窗口未完成 → 必须报 error（否则停摆无声）。"""
+    f = _facts(resolve_last_completed_date=None)
+    f["rounds"]["daily_predict"] = {"started": True, "completed": True}
+    f["rounds"]["evolve_predict"] = {"started": True, "completed": True}
+    out = assess(f, datetime(2026, 8, 13, 9, 35))
+    assert _check(out["checks"], "resolve")["status"] == "error"
+
+
+def test_resolve_pending_morning_but_yesterday_crashed_is_error():
+    f = _facts(
+        resolve_last_started_date="2026-08-12", resolve_last_completed_date="2026-08-11"
+    )
+    f["rounds"]["daily_predict"] = {"started": True, "completed": True}
+    f["rounds"]["evolve_predict"] = {"started": True, "completed": True}
+    out = assess(f, datetime(2026, 8, 13, 9, 35))
     assert _check(out["checks"], "resolve")["status"] == "error"
 
 

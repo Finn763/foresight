@@ -24,6 +24,7 @@ from predictor.calibration.calibrate import (
     load_calibrator,
 )
 from predictor.calibration.isotonic import IsotonicCalibrator
+from predictor.calibration.postprocess import clamp
 from predictor.llm.evidence import asearch_evidence
 from predictor.pipeline import Prediction
 
@@ -276,8 +277,8 @@ def websearch_predict(
                 pass
         return None
     probs = [s["probability"] for s in samples]
-    mean_prob = statistics.mean(probs)
-    prob = apply_calibrator(mean_prob, calibrator)
+    raw_prob = statistics.mean(probs)
+    prob = clamp(apply_calibrator(raw_prob, calibrator))
     citations = list(dict.fromkeys(u for s in samples for u in s["citations"]))
     evidence_ids = []
     for u in citations:
@@ -307,13 +308,16 @@ def websearch_predict(
             except Exception:
                 pass
         return None
-    rationale = min(samples, key=lambda s: abs(s["probability"] - mean_prob))["rationale"]
+    rationale = min(samples, key=lambda s: abs(s["probability"] - raw_prob))["rationale"]
+    model_name = f"{getattr(client, 'model', None) or 'unknown'}-websearch"
+    model_runs = {model_name: probs}
     pid = storage.add_prediction(
         question_id,
         prob,
         evidence_ids=evidence_ids,
-        model_runs={"deepseek-flash-websearch": probs},
+        model_runs=model_runs,
         arm="websearch",
+        raw_probability=raw_prob,
     )
     return Prediction(
         id=pid,
@@ -321,7 +325,7 @@ def websearch_predict(
         probability=prob,
         rationale=rationale,
         evidence_ids=evidence_ids,
-        model_runs={"deepseek-flash-websearch": probs},
+        model_runs=model_runs,
         report_md=_report(title, prob, rationale, citations, probs, baseline),
     )
 

@@ -1,12 +1,9 @@
 {
   "name": "foresight-agent-win32-x64",
-  "version": "0.3.0",
-  "description": "Foresight agent binary for Windows x64 (do not install directly).",
+  "version": "0.4.0",
+  "description": "Foresight engine binary (win32-x64; do not install directly).",
   "license": "MIT",
   "os": ["win32"],
   "cpu": ["x64"],
-  "files": ["bin"],
-  "bin": {
-    "foresight": "bin/foresight.exe"
-  }
+  "files": ["bin"]
 }

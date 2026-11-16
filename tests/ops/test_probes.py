@@ -106,6 +106,42 @@ def test_probe_scheduler_last_result_nonzero_warns(monkeypatch):
     assert out["ok"] is False and out["level"] == "warn" and "foresight-predict" in out["detail"]
 
 
+def test_probe_scheduler_health_exit1_is_alert_not_failure(monkeypatch):
+    """health 任务退出码 1 = 发现了告警（写盘+toast），不能算任务失败。"""
+    import subprocess
+
+    class FakeDone:
+        stdout = (
+            '"TaskName","Status","Last Run Time","Last Result"\n'
+            '"\\foresight-daily","Ready","2026/8/13 9:00:00","0"\n'
+            '"\\foresight-health","Ready","2026/8/13 9:35:00","1"\n'
+            '"\\foresight-health-pm","Ready","2026/8/13 16:40:00","1"\n'
+        ).encode("gbk")
+        stderr = b""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeDone())
+    out = probes._probe_scheduler()
+    assert out["ok"] is True
+
+
+def test_probe_scheduler_running_self_task_is_ok(monkeypatch):
+    """自检任务运行时 LastResult=267009（SCHED_S_TASK_RUNNING）不是失败。"""
+    import subprocess
+
+    class FakeDone:
+        stdout = (
+            '"TaskName","Status","Last Run Time","Last Result"\n'
+            '"\\foresight-daily","Ready","2026/8/13 9:00:00","0"\n'
+            '"\\foresight-health","Running","2026/8/13 9:35:00","267009"\n'
+            '"\\Foresight-Resolve","Ready","2026/8/13 16:30:00","0"\n'
+        ).encode("gbk")
+        stderr = b""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeDone())
+    out = probes._probe_scheduler()
+    assert out["ok"] is True
+
+
 def test_probe_scheduler_verbose_csv_real_header(monkeypatch):
     """真实 schtasks /v CSV（29 列中文表头，8-13 实机捕获）——非 verbose 无「上次结果」列。"""
     import subprocess

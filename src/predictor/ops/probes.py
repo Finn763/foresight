@@ -145,7 +145,15 @@ def _probe_scheduler() -> dict:
                     result = None
                 if result == 267011:
                     problems.append(f"{name} 从未运行过")
+                elif result in (267008, 267009):
+                    # READY/RUNNING（0x41300/0x41301）：自检任务自身正在运行时
+                    # LastResult=267009，不能当失败告警（实测 09:35 自检假阳性）。
+                    continue
                 elif result not in (None, 0):
+                    # health/health-pm 以「退出码 1 = 发现了告警」为设计（写盘+toast），
+                    # 不是任务自身失败；否则每次告警都会把自检任务自己再报一遍（自引用环）。
+                    if name.startswith("foresight-health"):
+                        continue
                     problems.append(f"{name} 上次结果={result}")
         # 若所有行均未匹配到 _TASKS 且无 disabled/problems，视为解析失败？但测试用例中小表头只有 4 列也需命中
         # 若 fieldnames 缺少关键列，上面 loop 自然不会产生 disabled/problems，但测试不应误判为正常

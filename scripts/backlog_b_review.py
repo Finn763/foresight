@@ -14,7 +14,7 @@ import argparse
 import csv
 import json
 import sys
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,12 +50,60 @@ def _snapshot(db_path: str, limit: int | None) -> list[dict]:
     return out[:limit] if limit else out
 
 
+def _done_qids(out_path: Path) -> set[int]:
+    """已复核 qid（断点续跑）：文件不存在/损坏 → 空集。"""
+    if not out_path.exists():
+        return set()
+    try:
+        with out_path.open(encoding="utf-8-sig", newline="") as f:
+            return {
+                int(row["qid"])
+                for row in csv.DictReader(f)
+                if (row.get("qid") or "").strip().isdigit()
+            }
+    except (OSError, ValueError, csv.Error):
+        return set()
+
+
+def _review_one(row: dict, resolver: LLMResolver) -> tuple[dict, str]:
+    q = SimpleNamespace(id=row["id"], title=row["title"], closes_at=row["closes_at"])
+    note = ""
+    outcome = ""
+    confidence = ""
+    citations = ""
+    try:
+        verdict = resolver.resolve(q, row["spec"], datetime.now(), ignore_grace=True)
+    except Exception as e:  # 单题失败不中断批次
+        verdict = None
+        note = f"{type(e).__name__}: {str(e)[:120]}"
+    if verdict is not None:
+        outcome = "true" if verdict[0] else "false"
+        extra = verdict[2] if len(verdict) > 2 and isinstance(verdict[2], dict) else {}
+        confidence = extra.get("confidence", "")
+        citations = ";".join(extra.get("citations") or [])
+    else:
+        note = note or "no_verdict（低置信/分歧/无证据，需人工）"
+    return (
+        {
+            "qid": row["id"],
+            "title": row["title"],
+            "closes_at": row["closes_at"].isoformat(timespec="seconds"),
+            "outcome": outcome,
+            "confidence": confidence,
+            "citations": citations,
+            "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+            "note": note,
+        },
+        outcome or "NO_VERDICT",
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="过期 B 类题批量复核（只读，不写库）")
     ap.add_argument("--db", default=Settings().db_path)
     ap.add_argument("--limit", type=int, default=0, help="只复核前 N 题（0=全部）")
     ap.add_argument("--out", default="data/backlog-b-review-20261116.csv")
-    ap.add_argument("--sleep", type=float, default=0.5, help="题间休眠秒数")
+    ap.add_argument("--workers", type=int, default=3, help="并发复核数（默认 3）")
     args = ap.parse_args()
 
     questions = _snapshot(args.db, args.limit or None)
@@ -64,57 +112,32 @@ def main() -> int:
         return 0
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    done = _done_qids(out_path)
+    todo = [q for q in questions if q["id"] not in done]
+    if not todo:
+        print(f"全部 {len(questions)} 题已复核（{out_path}）")
+        return 0
     fieldnames = [
         "qid", "title", "closes_at", "outcome", "confidence", "citations", "reviewed_at", "note",
     ]
     client = LLMClient(**Settings().llm_client_kwargs)
     resolver = LLMResolver(client, storage=None)
-
-    with out_path.open("w", newline="", encoding="utf-8-sig") as f:
+    append = out_path.exists()
+    with out_path.open("a" if append else "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for i, row in enumerate(questions, 1):
-            q = SimpleNamespace(
-                id=row["id"], title=row["title"], closes_at=row["closes_at"]
-            )
-            note = ""
-            outcome = ""
-            confidence = ""
-            citations = ""
-            try:
-                verdict = resolver.resolve(
-                    q, row["spec"], datetime.now(), ignore_grace=True
+        if not append:
+            writer.writeheader()
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+            futures = {ex.submit(_review_one, row, resolver): row for row in todo}
+            for i, fut in enumerate(as_completed(futures), 1):
+                rec, label = fut.result()
+                writer.writerow(rec)
+                f.flush()
+                print(
+                    f"[{i}/{len(todo)}] #{rec['qid']} -> {label}"
+                    f"{(' conf=' + str(rec['confidence'])) if rec['confidence'] != '' else ''}",
+                    flush=True,
                 )
-            except Exception as e:  # 单题失败不中断批次
-                verdict = None
-                note = f"{type(e).__name__}: {str(e)[:120]}"
-            if verdict is not None:
-                outcome = "true" if verdict[0] else "false"
-                extra = verdict[2] if len(verdict) > 2 and isinstance(verdict[2], dict) else {}
-                confidence = extra.get("confidence", "")
-                citations = ";".join(extra.get("citations") or [])
-            else:
-                note = note or "no_verdict（低置信/分歧/无证据，需人工）"
-            writer.writerow(
-                {
-                    "qid": row["id"],
-                    "title": row["title"],
-                    "closes_at": row["closes_at"].isoformat(timespec="seconds"),
-                    "outcome": outcome,
-                    "confidence": confidence,
-                    "citations": citations,
-                    "reviewed_at": datetime.now().isoformat(timespec="seconds"),
-                    "note": note,
-                }
-            )
-            f.flush()
-            print(
-                f"[{i}/{len(questions)}] #{row['id']} -> {outcome or 'NO_VERDICT'}"
-                f"{(' conf=' + str(confidence)) if confidence != '' else ''}",
-                flush=True,
-            )
-            if args.sleep and i < len(questions):
-                time.sleep(args.sleep)
     print(f"审阅结果已写入 {out_path}（未写库；入库请人工复核后走 resolve.py）")
     return 0
 

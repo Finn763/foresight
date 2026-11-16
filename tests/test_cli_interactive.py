@@ -32,7 +32,7 @@ class TestMainNoTitleNonTty:
         """无 title 且无 --publish → argparse usage 错误，退出码 2（JSON 契约不受影响）。"""
         import predictor.cli as cli
 
-        monkeypatch.setattr("sys.argv", ["foresight"])
+        monkeypatch.setattr("sys.argv", ["foresight", "--db", ":memory:"])
         with pytest.raises(SystemExit) as e:
             cli.main()
         assert e.value.code == 2
@@ -44,12 +44,24 @@ class TestDefaultDbFallback:
         """任意目录启动：默认 db 相对路径在 cwd 下不存在 → 回落项目根库，不在 cwd 建新库。"""
         import predictor.cli as cli
 
+        proj = tmp_path / "proj"
+        (proj / "data").mkdir(parents=True)
+        monkeypatch.setattr(cli, "_project_root", lambda: proj)
+        monkeypatch.setattr(cli, "_load_project_env", lambda: None)
+
+        class FakeSettings:
+            db_path = "data/foresight.db"
+
+        monkeypatch.setattr(cli, "Settings", FakeSettings)
         monkeypatch.setattr("sys.argv", ["foresight", "--publish", "99999"])
-        monkeypatch.chdir(tmp_path)
+        work = tmp_path / "work"
+        work.mkdir()
+        monkeypatch.chdir(work)  # 不碰真实生产库
         cli.main()
         out = capsys.readouterr().out
         assert '"ok": false' in out  # 打开了库并执行了查询
-        assert not (tmp_path / "data").exists()  # 没有在 cwd 下建新库
+        assert not (work / "data").exists()  # 没有在 cwd 下建新库
+        assert (proj / "data" / "foresight.db").exists()  # 回落到项目根库
 
 
 class TestStorageAutoMkdir:

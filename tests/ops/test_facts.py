@@ -102,9 +102,36 @@ def test_build_facts_rounds_and_files(tmp_path, monkeypatch):
     f = build_facts(st, now)
     assert f["rounds"]["daily_predict"] == {"started": True, "completed": True}
     assert f["rounds"]["evolve_predict"] == {"started": False, "completed": False}
+    assert f["resolve_last_started_date"] is None
+    assert f["resolve_last_completed_date"] is None
     assert f["lock"] == "stale"
     assert f["scoreboard_date"] == now.date().isoformat()
-    assert set(f) == {"rounds", "backlog", "storm", "lock", "scoreboard_date"}
+    assert set(f) == {
+        "rounds",
+        "resolve_last_started_date",
+        "resolve_last_completed_date",
+        "backlog",
+        "storm",
+        "lock",
+        "scoreboard_date",
+    }
+
+
+def test_build_facts_resolve_lookback(tmp_path):
+    """昨日/今日的 evolve_resolve 事件要落到回看字段，供次日晨检判断停摆。"""
+    import json
+    from datetime import datetime
+
+    from predictor.ops.facts import build_facts
+
+    st = Storage(str(tmp_path / "e.db"))
+    st.create_schema()
+    now = datetime.now()
+    st.log_evolution("round_started", json.dumps({"round": "evolve_resolve"}))
+    st.log_evolution("round_completed", json.dumps({"round": "evolve_resolve"}))
+    f = build_facts(st, now)
+    assert f["resolve_last_started_date"] == now.date().isoformat()
+    assert f["resolve_last_completed_date"] == now.date().isoformat()
 
 
 def test_build_facts_lock_state_override(tmp_path):

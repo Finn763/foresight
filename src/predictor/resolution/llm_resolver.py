@@ -41,14 +41,15 @@ class LLMResolver:
         self._client = client
         self._storage = storage
 
-    def resolve(self, question, spec: dict, now: datetime):
+    def resolve(self, question, spec: dict, now: datetime, *, ignore_grace: bool = False):
+        """ignore_grace=True 仅供批量复核脚本使用（只输出审阅结果，不写库）。"""
         if now < question.closes_at:
             return None  # 截止未到
         try:
             grace = int(spec.get("grace_days", 3))
         except (TypeError, ValueError):
             grace = 3
-        if now > question.closes_at + timedelta(days=grace):
+        if not ignore_grace and now > question.closes_at + timedelta(days=grace):
             return None  # 宽限已过 → resolve_round 超时分支接管降级
         samples = []
         for _ in range(2):

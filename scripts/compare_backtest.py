@@ -53,6 +53,7 @@ def main() -> None:
             client,
             [GDELTSource(start=pred_date - timedelta(days=7), end=pred_date)],
             now=pred_date,
+            calibrator=None,  # 回测禁用落盘校准器（避免用未来揭晓样本校准历史预测）
         )
         if pred is None:
             continue

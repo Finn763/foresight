@@ -1,11 +1,9 @@
 """Storage 真实 DuckDB 跑 CRUD + 揭晓回填 Brier + 分桶统计。"""
 
 from datetime import datetime, timedelta
-from types import SimpleNamespace
 
 import pytest
 
-import predictor.data.storage as storage_mod
 from predictor.data.storage import Storage
 
 

@@ -2,8 +2,9 @@
 Storage 是唯一数据访问入口，未来换 PG 时实现同接口即可。"""
 
 import json
+import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
@@ -18,6 +19,38 @@ class Question:
     outcome: bool | None
     resolved_at: datetime | None
     is_public: bool
+
+
+def _raw_from_model_runs(model_runs) -> float | None:
+    """从 model_runs 的单模型样本反推校准前原始分（老库回填用）。
+
+    websearch 臂的原始分是样本均值；classic 臂是等权中位再 extremize(alpha=0.2)。
+    多模型/非数值/非有限值一律返回 None（调用方回退到已存 probability）。
+    """
+    try:
+        mr = json.loads(model_runs) if isinstance(model_runs, str) else model_runs
+        if not isinstance(mr, dict) or len(mr) != 1:
+            return None
+        key, samples = next(iter(mr.items()))
+        vals = [float(x) for x in samples]
+        if not vals or not all(math.isfinite(v) for v in vals):
+            return None
+        if "websearch" in str(key):
+            raw = sum(vals) / len(vals)
+        else:
+            ordered = sorted(vals)
+            n = len(ordered)
+            acc = 0
+            median = ordered[-1]
+            for v in ordered:
+                acc += 1
+                if acc >= n / 2:
+                    median = v
+                    break
+            raw = 0.5 + (median - 0.5) * 1.2  # extremize(alpha=0.2)
+        return max(0.01, min(0.99, raw))
+    except Exception:
+        return None
 
 
 class Storage:
@@ -56,6 +89,7 @@ class Storage:
                 id INTEGER PRIMARY KEY DEFAULT nextval('seq_predictions'),
                 question_id INTEGER NOT NULL REFERENCES questions(id),
                 probability DOUBLE NOT NULL CHECK (probability BETWEEN 0.01 AND 0.99),
+                raw_probability DOUBLE,       -- 校准前原始分（校准器 fit 的输入）
                 brier_score DOUBLE,
                 evidence_ids JSON NOT NULL,
                 model_runs JSON,
@@ -152,6 +186,19 @@ class Storage:
                 detail TEXT
             );
         """)
+        # 增量列：校准前原始分（老库无此列）。校准器必须 fit 原始分→outcome，
+        # 否则会把「已校准输出」再校准一次（实测 0.54→0.709→0.448 双重校准）。
+        self._conn.execute("ALTER TABLE predictions ADD COLUMN IF NOT EXISTS raw_probability DOUBLE")
+        try:
+            self._migrate_raw_probability()
+        except Exception as e:
+            import sys
+
+            print(
+                f"[storage] raw_probability 回填失败（跳过，下次启动重试）: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
         # CC §2.7① 证据表去重迁移（2026-08-27）：见 _migrate_source_documents_unique。
         # 独立方法而非 SQL 串：UPDATE...FROM + FIRST() OVER 窗口在 DuckDB 1.5.5 的
         # 多语句批处理中第二次执行会触发内部错误（optional pointer），Python 侧
@@ -175,10 +222,14 @@ class Storage:
 
         口径：按 (question_id,url) 分组保留一行——content 非空优先（「可溯源」优先保
         正文），全空则任意一行；url IS NULL 不参与（无 URL 可比对，DuckDB 唯一索引
-        视 NULL 互异本就不拦截）。curated_documents 对被清理行的引用先重定向到保留行。
+        视 NULL 互异本就不拦截）。被清理行的引用必须重定向：curated_documents.document_id
+        与 predictions.evidence_ids（JSON 数组）都指向 source_documents.id，漏改后者
+        会留下悬空引用（生产实测 47 个引用/21 条预测）。
         生产库 2026-08-27 实测 55 组重复（每组 2 行，多余 55 行）、curated_documents
         0 行；本方法随生产下次启动 create_schema 时执行（由用户择时，不直接对生产库写）。
         """
+        # 空 URL 不是有效去重键（'' 相互相等会被误合并），先归一为 NULL。
+        self._conn.execute("UPDATE source_documents SET url = NULL WHERE url = ''")
         has_index = self._conn.execute(
             "SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = "
             "'uq_source_documents_qid_url' AND table_name = 'source_documents' AND is_unique"
@@ -191,23 +242,66 @@ class Storage:
             FROM source_documents WHERE url IS NOT NULL
             GROUP BY question_id, url
         """).fetchall()
+        redirect: dict[int, int] = {}
         for question_id, url, keep_id in groups:
+            dup_ids = [
+                r[0]
+                for r in self._conn.execute(
+                    "SELECT id FROM source_documents WHERE question_id IS NOT DISTINCT FROM ? "
+                    "AND url IS NOT DISTINCT FROM ? AND id <> ?",
+                    [question_id, url, keep_id],
+                ).fetchall()
+            ]
+            redirect.update({dup_id: keep_id for dup_id in dup_ids})
             # 重定向 curated 引用（防御性；生产 0 行）
-            self._conn.execute(
-                "UPDATE curated_documents SET document_id = ? WHERE document_id IN ("
-                "  SELECT id FROM source_documents WHERE question_id IS NOT DISTINCT FROM ? "
-                "  AND url IS NOT DISTINCT FROM ? AND id <> ?)",
-                [keep_id, question_id, url, keep_id],
-            )
+            if dup_ids:
+                self._conn.execute(
+                    "UPDATE curated_documents SET document_id = ? WHERE document_id IN ("
+                    "  SELECT id FROM source_documents WHERE question_id IS NOT DISTINCT FROM ? "
+                    "  AND url IS NOT DISTINCT FROM ? AND id <> ?)",
+                    [keep_id, question_id, url, keep_id],
+                )
             self._conn.execute(
                 "DELETE FROM source_documents WHERE question_id IS NOT DISTINCT FROM ? "
                 "AND url IS NOT DISTINCT FROM ? AND id <> ?",
                 [question_id, url, keep_id],
             )
+        if redirect:
+            # 一次性重定向全部 predictions.evidence_ids（JSON 数组文本）
+            for pid, raw in self._conn.execute(
+                "SELECT id, evidence_ids FROM predictions"
+            ).fetchall():
+                try:
+                    ids = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+                except Exception:
+                    continue
+                fixed = [redirect.get(i, i) for i in ids]
+                if fixed != ids:
+                    self._conn.execute(
+                        "UPDATE predictions SET evidence_ids = ? WHERE id = ?",
+                        [json.dumps(fixed), pid],
+                    )
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_source_documents_qid_url "
             "ON source_documents(question_id, url)"
         )
+
+    def _migrate_raw_probability(self) -> None:
+        """老库回填 raw_probability：从 model_runs 的样本反推校准前原始分。
+
+        - websearch 臂：原始分 = 样本均值（websearch_predict 的 mean_prob）
+        - classic 臂：原始分 = extremize(样本中位, alpha=0.2)（等权 ensemble 默认路径）
+        多模型/不可解析的行保持 NULL，calibration_pairs 回退到 probability。
+        """
+        rows = self._conn.execute(
+            "SELECT id, model_runs FROM predictions WHERE raw_probability IS NULL"
+        ).fetchall()
+        for pid, mr_json in rows:
+            raw = _raw_from_model_runs(mr_json)
+            if raw is not None:
+                self._conn.execute(
+                    "UPDATE predictions SET raw_probability = ? WHERE id = ?", [raw, pid]
+                )
 
     # ---- questions ----
     def add_question(
@@ -348,16 +442,22 @@ class Storage:
         model_runs: dict,
         arm: str = "baseline",
         arm_group: int | None = None,
+        raw_probability: float | None = None,
     ) -> int:
         if not evidence_ids:
             raise ValueError("evidence_ids 不能为空：预测必须可溯源")
+        if not math.isfinite(probability):
+            raise ValueError(f"probability 非有限值: {probability!r}")
+        if raw_probability is not None and not math.isfinite(raw_probability):
+            raise ValueError(f"raw_probability 非有限值: {raw_probability!r}")
         probability = max(0.01, min(0.99, probability))
         cur = self._conn.execute(
-            "INSERT INTO predictions (question_id, probability, evidence_ids, model_runs, "
-            "arm, arm_group) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO predictions (question_id, probability, raw_probability, evidence_ids, "
+            "model_runs, arm, arm_group) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
             [
                 question_id,
                 probability,
+                raw_probability,
                 json.dumps(evidence_ids),
                 json.dumps(model_runs),
                 arm,
@@ -379,6 +479,9 @@ class Storage:
         published_at: datetime | None,
         fetched_at: datetime | None = None,
     ) -> int:
+        # 空串会被唯一索引当成同一 URL，导致第二篇无链接文档被静默丢弃、引用错位；
+        # 统一归一为 NULL（NULL 互异，不参与去重）。
+        url = url or None
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO source_documents (question_id, source, url, title, content, "
             "published_at, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
@@ -643,8 +746,11 @@ class Storage:
         口径=「系统最终输出」：每道题取最后一条预测（不限 arm——生产臂 websearch
         的预测行 brier_score 恒 NULL，按计分行口径会永远学不到生产分布），
         与揭晓 outcome 配对；未揭晓题（outcome IS NULL）不进。"""
+        # 必须用校准前原始分：用已校准的 probability 再 fit 会造成双重校准
+        # （实测 0.54→0.709→0.448）。老行 raw_probability 由迁移从 model_runs 回填，
+        # 无法回填时回退到已存 probability。
         rows = self._conn.execute(
-            "SELECT p.probability, q.outcome FROM predictions p "
+            "SELECT COALESCE(p.raw_probability, p.probability), q.outcome FROM predictions p "
             "JOIN questions q ON p.question_id = q.id "
             "WHERE q.outcome IS NOT NULL AND p.id = ("
             "  SELECT p2.id FROM predictions p2 WHERE p2.question_id = p.question_id "

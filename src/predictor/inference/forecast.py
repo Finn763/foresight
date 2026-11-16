@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,6 +67,8 @@ def forecast(
                 temperature=0.5,
             )
             p = float(out["probability"])
+            if not math.isfinite(p):
+                raise ValueError(f"probability 非有限值: {p!r}")
             return ForecastResult(
                 probability=max(0.0, min(1.0, p)),
                 rationale=str(out.get("rationale", "")),

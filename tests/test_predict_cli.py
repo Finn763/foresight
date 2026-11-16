@@ -11,8 +11,19 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 from predictor.data.storage import Storage
 from predictor.pipeline import run_prediction
+
+
+@pytest.fixture(autouse=True)
+def _offline_series(monkeypatch):
+    monkeypatch.setenv("FORESIGHT_OFFLINE", "1")
+    from predictor.stats.historical import cache_clear
+
+    cache_clear()
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "scripts" / "predict_cli.py"
@@ -24,7 +35,7 @@ class FakeClient:
     def chat_json(self, messages, **kw):
         return {"terms": ["term"]}
 
-    def chat(self, messages, **kw):
+    def chat(self, model, messages, **kw):
         return '{"summary": "s"}'
 
 
@@ -33,7 +44,7 @@ def test_no_evidence_rejects_prediction():
     st.create_schema()
     qid = st.add_question("美联储9月会加息吗", datetime(2026, 9, 17))
     client = FakeClient()
-    pred = run_prediction(qid, st, client, [], now=None)  # 无数据源
+    pred = run_prediction(qid, st, client, [], now=None, calibrator=None)  # 无数据源
     assert pred is None  # 无证据 → 拒绝出预测，不崩溃
 
 
@@ -46,6 +57,7 @@ def test_cli_qid_rejects_missing_and_overdue(tmp_path):
     st._conn.close()
 
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["FORESIGHT_OFFLINE"] = "1"
     for qid, expect in ((99999, "题目不存在"), (overdue, "已到期")):
         r = subprocess.run(
             [sys.executable, str(CLI), "--qid", str(qid), "--db", str(db)],
@@ -70,6 +82,7 @@ def test_cli_publish_draft_roundtrip(tmp_path):
     st._conn.close()  # Windows 文件锁：subprocess 打开同一 DB 前先释放
 
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["FORESIGHT_OFFLINE"] = "1"
     r = subprocess.run(
         [sys.executable, str(CLI), "--publish", str(qid), "--db", str(db)],
         capture_output=True,

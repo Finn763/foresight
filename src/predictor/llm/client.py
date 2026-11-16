@@ -86,6 +86,8 @@ async def _post_with_retry(client, url, payload, headers, max_retries, check):
                     continue
                 break
             data = resp.json()
+            # 每个 200 响应都记账：截断/空响应重试同样消耗 token，只在成功分支记会漏账。
+            _record_usage(data)
             if check is not None and not check(data, payload, attempt):
                 # check 内部已按需改 payload 并约定 last_err
                 last_err = LLMError("retrying: empty/truncated")
@@ -93,7 +95,6 @@ async def _post_with_retry(client, url, payload, headers, max_retries, check):
                     await asyncio.sleep(2**attempt)
                     continue
                 break
-            _record_usage(data)
             return data
         except (httpx.HTTPError, KeyError, ValueError) as e:
             last_err = e

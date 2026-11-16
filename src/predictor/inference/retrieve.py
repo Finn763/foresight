@@ -1,8 +1,9 @@
 # retrieve.py
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from predictor.data.sources import BaseSource, Document
+from predictor.timeutil import CN_TZ
 
 
 def retrieve_and_store(
@@ -15,11 +16,18 @@ def retrieve_and_store(
     now: datetime | None = None,
 ) -> list[Document]:
     now = now or datetime.now()
-    if now.tzinfo is not None:
-        now = now.replace(tzinfo=None)  # 统一为 naive UTC 比较/入库（DuckDB TIMESTAMP 无时区）
+    # naive 入参按本地时钟解释（与 datetime.now() 调用方一致），再统一成 naive UTC。
+    # 旧实现直接 strip tzinfo，把本地时间当 UTC，回测 cutoff 最多放宽 8 小时
+    # （truthset_replay 传北京 naive pred_date，会放进预测时点之后的新闻）。
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=CN_TZ)
+    now = now.astimezone(UTC).replace(tzinfo=None)
 
     def _norm(dt: datetime) -> datetime:
-        return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+        # 文档时间契约不同：各 source 已统一产出 UTC（aware 或 naive-UTC）。
+        if dt.tzinfo is not None:
+            return dt.astimezone(UTC).replace(tzinfo=None)
+        return dt
 
     docs: list[Document] = []
     seen: set[str] = set()

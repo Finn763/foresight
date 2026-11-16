@@ -1,7 +1,18 @@
 from datetime import datetime
 
+import pytest
+
 from predictor.data.sources import Document
 from predictor.pipeline import run_prediction
+
+
+@pytest.fixture(autouse=True)
+def _offline_series(monkeypatch):
+    """隔离：run_prediction 会拉 10 个真实行情序列；单测必须零网络。"""
+    monkeypatch.setenv("FORESIGHT_OFFLINE", "1")
+    from predictor.stats.historical import cache_clear
+
+    cache_clear()
 
 
 class FakeStore:
@@ -18,7 +29,15 @@ class FakeStore:
         return len(self.docs)
 
     def add_prediction(
-        self, qid, probability, *, evidence_ids, model_runs, arm="baseline", arm_group=None
+        self,
+        qid,
+        probability,
+        *,
+        evidence_ids,
+        model_runs,
+        arm="baseline",
+        arm_group=None,
+        raw_probability=None,
     ):
         assert evidence_ids, "必须有证据"
         self.preds.append(probability)
@@ -33,7 +52,7 @@ class FakeClient:
             return {"relevant": [0]}
         return {"probability": 0.55, "rationale": "r"}
 
-    def chat(self, messages, **kw):
+    def chat(self, model, messages, **kw):
         return '{"summary": "s"}'
 
 
@@ -48,7 +67,9 @@ class FakeSource:
 
 def test_run_prediction_end_to_end():
     store = FakeStore()
-    pred = run_prediction(1, store, FakeClient(), [FakeSource()], now=datetime(2026, 8, 2))
+    pred = run_prediction(
+        1, store, FakeClient(), [FakeSource()], now=datetime(2026, 8, 2), calibrator=None
+    )
     assert pred is not None
     assert 0.01 <= pred.probability <= 0.99
     assert pred.evidence_ids  # 证据链存在
@@ -81,9 +102,11 @@ def test_run_prediction_rejects_no_evidence():
 
 def test_run_prediction_keeps_all_samples_in_model_runs():
     store = FakeStore()
-    pred = run_prediction(1, store, FakeClient(), [FakeSource()], now=datetime(2026, 8, 2))
+    pred = run_prediction(
+        1, store, FakeClient(), [FakeSource()], now=datetime(2026, 8, 2), calibrator=None
+    )
     assert pred is not None
-    assert pred.model_runs["deepseek-flash"] == [0.55, 0.55, 0.55]  # n_samples=3 全量采样
+    assert pred.model_runs["unknown"] == [0.55, 0.55, 0.55]  # FakeClient 无 model 属性
     assert store.preds == [pred.probability]
 
 
@@ -111,7 +134,12 @@ def test_run_prediction_skips_question_when_search_terms_llm_fails():
 
     store = LoggingStore()
     pred = run_prediction(
-        1, store, FailingSearchTermsClient(), [FakeSource()], now=datetime(2026, 8, 2)
+        1,
+        store,
+        FailingSearchTermsClient(),
+        [FakeSource()],
+        now=datetime(2026, 8, 2),
+        calibrator=None,
     )
     assert pred is None  # 单题跳过，不返回预测
     assert store.logs  # 有归因日志

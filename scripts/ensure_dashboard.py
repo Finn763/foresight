@@ -4,8 +4,10 @@ CC 评审 §3.4：8765 服务长期手工启动（8/25 17:36 起的控制台 pyt
 机制，机器重启即丢，与 signsrv 待遇不对称。本脚本仿照 ensure_signsrv.py 接入 ensure
 体系（schtasks Foresight-Dashboard 每 30 分钟触发）。逻辑：
   1. 探测 127.0.0.1:8765 端口监听 + GET /api/health HTTP 200 → 已活则静默 exit 0（幂等）；
-  2. 未监听 → DETACHED 拉起 .venv/Scripts/python.exe -E -X utf8 scripts/web_server.py，
-     stdout/stderr 追加 data/web_server.log（新增独立服务日志）；
+  2. 未监听 → DETACHED 拉起 base 解释器（pyvenv.cfg 的 home）+ sys.path 注入 venv
+     site-packages/项目路径，执行 scripts/web_server.py；stdout/stderr 追加
+     data/web_server.log。不能直接用 .venv/Scripts/python.exe：uv 的 venv 垫片在
+     SYSTEM/session-0 任务里 CreateProcess 后以 0xC0000142（DLL init failed）退出；
   3. 端口被占但 /api/health 非 200 → 视为异常占用，exit 1 让 LastTaskResult 可见
      （与 ensure_signsrv 的「占用但 pong 不对即失败」同构）。
 本脚本只用标准库，任意 Python 均可运行（schtasks 动作经 run_silent.py 用 base GUI
@@ -67,38 +69,77 @@ def probe() -> str:
     return "alive" if _http_ok() else "occupied"
 
 
+def _base_python() -> Path:
+    """从 .venv/pyvenv.cfg 取 base 解释器路径（uv 的 venv 垫片在 SYSTEM 下 0xC0000142）。"""
+    cfg = ROOT / ".venv" / "pyvenv.cfg"
+    try:
+        for line in cfg.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "home":
+                home = Path(value.strip())
+                exe = home / ("python.exe" if os.name == "nt" else "python3")
+                if exe.exists():
+                    return exe
+    except OSError:
+        pass
+    return PY
+
+
+def _launch_argv(argv: list[str]) -> list[str]:
+    """base 解释器 + sys.path 注入（等价 run_silent.py 的做法），再执行 web_server。"""
+    sp = ROOT / ".venv" / "Lib" / "site-packages"
+    if not sp.is_dir():
+        sp = ROOT / ".venv" / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    bootstrap = (
+        "import sys;"
+        f"sys.path.insert(0, {str(sp)!r});"
+        f"sys.path.insert(0, {str(ROOT / 'src')!r});"
+        f"sys.path.insert(0, {str(ROOT)!r});"
+        f"sys.argv = [{str(SRV_SCRIPT)!r}, *{argv!r}];"
+        "import runpy;"
+        f"runpy.run_path({str(SRV_SCRIPT)!r}, run_name='__main__')"
+    )
+    return [str(_base_python()), "-E", "-X", "utf8", "-c", bootstrap]
+
+
 def launch(argv: list[str] | None = None) -> subprocess.Popen:
-    """DETACHED 无窗拉起 web_server.py（项目铁律：venv python + -E -X utf8）。
+    """DETACHED 无窗拉起 web_server.py（base 解释器 + 注入 venv site-packages）。
 
     argv 透传（默认空 → web_server 默认 internal 模式 127.0.0.1:8765）；测试可用
     --port 换端口做隔离演练。返回 Popen 句柄供调用方管理（main 忽略之）。
     """
+    breakaway = 0x01000000  # CREATE_BREAKAWAY_FROM_JOB：跳出宿主 Job Object
     flags = (
         0x00000008  # DETACHED_PROCESS：不继承父控制台
         | 0x00000200  # CREATE_NEW_PROCESS_GROUP
         | 0x08000000  # CREATE_NO_WINDOW：不弹窗
-        | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB：跳出宿主 Job Object（任务宿主回收
-        # 时整树被杀——signsrv 2026-08-21 静默死亡即此嫌疑）
+        | breakaway
     )
     env = dict(os.environ)
-    # 项目铁律：Hermes 等宿主注入的 PYTHONPATH 会搅炸 venv 3.13（pydantic_core 加载失败），
+    # 项目铁律：Hermes 等宿主注入的 PYTHONPATH 会搅炸 venv（pydantic_core 加载失败），
     # 必须移除；-E 同时忽略所有 PYTHON* 环境变量（双保险）。
     env.pop("PYTHONPATH", None)
     # 服务 banner/日志含中文，stdout 重定向到文件后走 locale 编码(cp936)会
-    # UnicodeEncodeError 崩溃；-X utf8 + 此处双保险（ensure_signsrv 同款）。
+    # UnicodeEncodeError 崩溃；-X utf8 为主，环境变量为兜底。
     env["PYTHONIOENCODING"] = "utf-8"
     _LOG.parent.mkdir(parents=True, exist_ok=True)
+    cmd = _launch_argv(argv or [])
+    kwargs = dict(
+        cwd=str(ROOT),
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        env=env,
+    )
     with _LOG.open("ab") as log:
-        return subprocess.Popen(
-            [str(PY), "-E", "-X", "utf8", str(SRV_SCRIPT), *(argv or [])],
-            cwd=str(ROOT),
-            stdout=log,
-            stderr=log,
-            stdin=subprocess.DEVNULL,
-            creationflags=flags,
-            close_fds=True,
-            env=env,
-        )
+        try:
+            return subprocess.Popen(cmd, stdout=log, stderr=log, creationflags=flags, **kwargs)
+        except OSError as e:
+            # 受限 Job 拒绝 breakaway（实测 WinError 5）时降级：留在宿主 Job 内，
+            # 至少保证本轮拉起成功；任务宿主回收时子树可能被杀，由下一轮 ensure 续上。
+            _log_line(f"launch without breakaway ({type(e).__name__}: {e})")
+            return subprocess.Popen(
+                cmd, stdout=log, stderr=log, creationflags=flags & ~breakaway, **kwargs
+            )
 
 
 def _wait_up(timeout: float = 30.0) -> bool:

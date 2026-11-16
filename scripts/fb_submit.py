@@ -81,7 +81,7 @@ def main() -> None:
     predictions = []  # [{question_id(官方), probability, local_question_id, title, closes_at}]
     for q in todo:
         local_id = st.add_question(q.title, q.closes_at, is_public=False)
-        pred = run_prediction(local_id, st, client, sources)
+        pred = run_prediction(local_id, st, client, sources, calibrator=None)
         if pred is None:
             print(f"  跳过(无证据): {q.title}")
             continue

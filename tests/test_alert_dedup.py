@@ -158,9 +158,10 @@ def test_cli_same_day_alert_merged(tmp_path):
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["FORESIGHT_OFFLINE"] = "1"
     cmd = [
         str(PY), "-E", "-X", "utf8", str(HC), "--db", str(db), "--now", now.isoformat(),
-        "--no-notify",
+        "--no-notify", "--no-probe",
     ]
     r1 = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, timeout=120)
     r2 = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, timeout=120)

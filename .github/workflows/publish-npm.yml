@@ -8,9 +8,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "子包版本（与主包一致）"
+        description: "发布版本（必须与 packaging/npm/foresight-agent/package.json 一致）"
         required: true
-        default: "0.3.0"
+        default: "0.4.0"
   push:
     tags: ["v*"]
 
@@ -22,12 +22,20 @@ jobs:
         include:
           - os: windows-latest
             pkg: win32-x64
+            npm_os: win32
+            npm_cpu: x64
           - os: macos-15-intel
             pkg: darwin-x64
+            npm_os: darwin
+            npm_cpu: x64
           - os: macos-latest
             pkg: darwin-arm64
+            npm_os: darwin
+            npm_cpu: arm64
           - os: ubuntu-latest
             pkg: linux-x64
+            npm_os: linux
+            npm_cpu: x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,13 +59,29 @@ jobs:
         run: |
           V="${GITHUB_REF_NAME#v}"
           [ "${{ github.event_name }}" = "workflow_dispatch" ] && V="${{ github.event.inputs.version }}"
+          MAIN_VERSION=$(node -p "require('./packaging/npm/foresight-agent/package.json').version")
+          if [ "$V" != "$MAIN_VERSION" ]; then
+            echo "版本不一致：输入/标签=$V，主包=$MAIN_VERSION" >&2
+            exit 1
+          fi
           EXT=${{ runner.os == 'Windows' && '".exe"' || '""' }}
           mkdir -p pkg/bin
           cp dist/foresight* pkg/bin/foresight${EXT}
-          sed -e "s/0.3.0/${V}/g" \
-              -e "s/foresight-agent-win32-x64/foresight-agent-${{ matrix.pkg }}/g" \
-              -e "s/bin\/foresight\.exe/bin\/foresight${EXT}/g" \
-              packaging/npm/foresight-agent-win32-x64/package.json > pkg/package.json
+          # 逐平台写 os/cpu：旧实现只 sed 版本/包名/路径，四个平台包都带 win32/x64 元数据，
+          # npm 会在 macOS/Linux 上直接判定不兼容而不安装（README 的多平台承诺落空）。
+          node -e '
+            const fs = require("fs");
+            const [src, out, name, version, os, cpu] = process.argv.slice(1);
+            const p = JSON.parse(fs.readFileSync(src, "utf8"));
+            p.name = name;
+            p.version = version;
+            p.os = [os];
+            p.cpu = [cpu];
+            p.description = `Foresight engine binary (${os}-${cpu}; do not install directly).`;
+            delete p.bin;  // 平台包只提供二进制；裸 foresight 命令归 agent shell
+            fs.writeFileSync(out, JSON.stringify(p, null, 2) + "\n");
+          ' packaging/npm/foresight-agent-win32-x64/package.json pkg/package.json \
+            "foresight-agent-${{ matrix.pkg }}" "$V" "${{ matrix.npm_os }}" "${{ matrix.npm_cpu }}" "$EXT"
 
       - name: Configure npm auth
         shell: bash

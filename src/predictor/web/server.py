@@ -16,6 +16,7 @@ import duckdb
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from predictor.config import Settings
 from predictor.data.storage import Storage
@@ -107,6 +108,14 @@ def _render_alert_banner(alert: dict) -> str:
 
 def create_app(mode: str = "internal") -> FastAPI:
     app = FastAPI(title="Foresight", docs_url=None, redoc_url=None, openapi_url=None)
+    if mode == "internal":
+        # internal 无认证：只接受 loopback Host，阻断 DNS rebinding（攻击页 rebind 到
+        # 127.0.0.1 后浏览器会视为同源）。testserver 供 TestClient；IPv6 loopback 不
+        # 在默认绑定内（Starlette 按 ':' 切 Host，[::1] 无法匹配）。
+        app.add_middleware(
+            TrustedHostMiddleware,
+            allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+        )
     app.state.mode = mode
     app.state.db_path = Settings().db_path  # scripts/web_server.py 的 --db 覆盖此处
 

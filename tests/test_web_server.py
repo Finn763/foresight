@@ -23,6 +23,17 @@ def db_path(tmp_path):
     return str(tmp_path / "e.db")
 
 
+def test_internal_rejects_foreign_host(db_path):
+    """DNS rebinding 防护：internal 只接受 loopback/testserver Host。"""
+    app = create_app(mode="internal")
+    app.state.db_path = db_path
+    with TestClient(app) as c:
+        r = c.get("/api/health", headers={"host": "evil.example"})
+        assert r.status_code == 400
+        ok = c.get("/api/health")
+        assert ok.status_code == 200  # TestClient 默认 Host=testserver
+
+
 def test_health_ok(db_path):
     app = create_app(mode="internal")
     app.state.db_path = db_path

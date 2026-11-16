@@ -24,6 +24,13 @@ def main() -> None:
     ap.add_argument("--mode", choices=["internal", "public"], default="internal")
     ap.add_argument("--db", default=None, help="DuckDB 路径（默认 Settings().db_path）")
     args = ap.parse_args()
+    if args.mode == "internal" and args.host not in ("127.0.0.1", "localhost"):
+        # internal 模式无认证；--host 0.0.0.0 会把题池/日志/人工揭晓全暴露到局域网。
+        # 对外展示请用 --mode public（内部端点不注册）。
+        ap.error(
+            "internal 模式无认证，只允许 loopback（127.0.0.1/localhost）；"
+            "局域网展示请用 --mode public"
+        )
 
     app = create_app(mode=args.mode)
     if args.db:

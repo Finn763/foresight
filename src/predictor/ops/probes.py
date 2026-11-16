@@ -69,14 +69,29 @@ def _probe_quotes() -> dict:
 
 
 def _probe_llm() -> dict:
+    """同时探测 chat 与搜索接口。
+
+    2026-09-10~10-26 预测全灭时搜索接口已失效而纯 chat 仍正常——只测 chat 会假绿。
+    """
+    out: dict = {}
     try:
         s = Settings()
-        LLMClient(**s.llm_client_kwargs).chat(
-            None, [{"role": "user", "content": "回复 pong"}], max_tokens=512
-        )
-        return {"ok": True, "detail": "LLM 可达"}
+        client = LLMClient(**s.llm_client_kwargs)
     except Exception as e:
-        return {"ok": False, "detail": f"{type(e).__name__}: {str(e)[:120]}"}
+        return {"ok": False, "detail": f"client init: {type(e).__name__}: {str(e)[:120]}"}
+    try:
+        client.chat(None, [{"role": "user", "content": "回复 pong"}], max_tokens=512)
+        out["chat"] = True
+    except Exception as e:
+        out["chat"] = f"{type(e).__name__}: {str(e)[:120]}"
+    try:
+        results = client.search("OpenAI 最新消息", count=1)
+        out["search"] = len(results) > 0
+        out["search_n"] = len(results)
+    except Exception as e:
+        out["search"] = f"{type(e).__name__}: {str(e)[:120]}"
+    ok = out.get("chat") is True and out.get("search") is True
+    return {"ok": ok, "detail": json.dumps(out, ensure_ascii=False)}
 
 
 # 调度任务匹配前缀（覆盖实机 12 个任务：health 前缀含 Health-PM、autopick 前缀含 AutoPickIngest）

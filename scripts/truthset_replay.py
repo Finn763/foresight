@@ -68,6 +68,7 @@ def replay(rows: list[dict], client, limit: int | None) -> dict:
             client,
             [GDELTSource(start=pred_date - timedelta(days=7), end=pred_date)],
             now=pred_date,
+            calibrator=None,  # 回放禁用落盘校准器（未来信息）
         )
         if pred is None:
             skipped += 1

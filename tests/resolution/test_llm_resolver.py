@@ -255,6 +255,20 @@ def test_window_bounds():
     assert not c.calls  # 窗口外不调用
 
 
+def test_ignore_grace_allows_retrospective_review_only():
+    c = FakeClient(
+        [
+            _ok_response(True, 0.9, ["https://a/1"]),
+            _ok_response(True, 0.85, ["https://a/1"]),
+        ]
+    )
+    r = LLMResolver(c)
+    q = _q(datetime(2026, 8, 13, 9, 0))
+    out = r.resolve(q, _spec(), datetime(2026, 8, 20, 9, 0), ignore_grace=True)
+    assert out is not None and out[0] is True
+    assert len(c.calls) == 2  # 双采样护栏照常生效
+
+
 def test_storage_none_silently_skips_logging():
     c = FakeClient(
         [

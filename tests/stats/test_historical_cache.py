@@ -212,3 +212,34 @@ def test_concurrent_fetch_parallel_and_data_integrity():
     # 该轮成功 → 已写缓存：同日二次调用零新增请求
     fetch_series_map(datetime(2026, 9, 1, 20, 0))
     assert len(requests) == 10
+
+
+def test_fetch_series_excludes_end_date_bar(_offline_env):
+    """Yahoo 当日 bar 含最终收盘（时间戳却是开盘）→ 预测时点当天必须剔除。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ts = [
+            int(datetime(2026, 8, 12, 13, 30, tzinfo=UTC).timestamp()),
+            int(datetime(2026, 8, 13, 13, 30, tzinfo=UTC).timestamp()),
+        ]
+        closes = [7700.0, 7799.0]
+        payload = {
+            "chart": {
+                "result": [
+                    {
+                        "timestamp": ts,
+                        "indicators": {
+                            "quote": [
+                                {"close": closes, "open": closes, "high": closes, "low": closes}
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+        return httpx.Response(200, json=payload)
+
+    historical.set_transport(httpx.MockTransport(handler))
+    end_ts = int(datetime(2026, 8, 13, 8, 0).timestamp())  # 8-13 08:00 北京 = 8-13 00:00Z
+    bars = historical.fetch_series("^GSPC", end_ts=end_ts)
+    assert [b["date"] for b in bars] == ["2026-08-12"]

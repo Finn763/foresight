@@ -416,8 +416,8 @@ def test_record_high_false():
 
 
 def test_record_high_incomplete_window_degrades():
-    # K 线最后 bar 8-13 < 窗口末 8-14 → 数据未齐 → None（宽限内重试）
-    bars = [(_jd(27), 7700.0), (_jd(31), 7710.0)] + [(_d(13), 7740.0)]
+    # K 线最后 bar 8-12 < 窗口末 8-13（closes 8-14 → 最后完整交易日 8-13）→ 未齐 → None
+    bars = [(_jd(27), 7700.0), (_jd(31), 7710.0)] + [(_d(12), 7740.0)]
     r = MarketResolver(_FakeQuotes({}), None, fetch_kline=_fake_kline(bars))
     assert r.resolve(_rh_question(), _rh_spec(), datetime(2026, 8, 15, 16, 30)) is None
 
@@ -438,8 +438,8 @@ def test_record_high_truncated_prior_degrades():
 
 def test_record_high_dual_source_disagree_degrades():
     # 主源判 True、备源判 False → 分歧降级（不猜）
-    bars_p = [(_jd(27), 7700.0), (_jd(31), 7710.0), (_d(14), 7740.0), (_d(1), 7690.0)]
-    bars_b = [(_jd(27), 7700.0), (_jd(31), 7730.0), (_d(14), 7715.0), (_d(1), 7690.0)]
+    bars_p = [(_jd(27), 7700.0), (_jd(31), 7710.0), (_d(13), 7740.0), (_d(1), 7690.0)]
+    bars_b = [(_jd(27), 7700.0), (_jd(31), 7730.0), (_d(13), 7715.0), (_d(1), 7690.0)]
     kl = {(("tencent", "usINX")): bars_p, ("yahoo", "^GSPC"): bars_b}
 
     def f(provider, symbol):
@@ -451,7 +451,7 @@ def test_record_high_dual_source_disagree_degrades():
 
 def test_record_high_backup_fail_knife_edge_degrades():
     # 备源挂 + 单源 margin 0.1% < 0.2% → 刀口不猜 None
-    bars = [(_jd(27), 7700.0), (_jd(31), 7710.0), (_d(14), 7717.7), (_d(1), 7690.0)]
+    bars = [(_jd(27), 7700.0), (_jd(31), 7710.0), (_d(13), 7717.7), (_d(1), 7690.0)]
     r = MarketResolver(
         _FakeQuotes({}), None, fetch_kline=_fake_kline(bars, errors={("yahoo", "^GSPC")})
     )
@@ -460,9 +460,77 @@ def test_record_high_backup_fail_knife_edge_degrades():
 
 def test_record_high_backup_fail_margin_ok_judges():
     # 备源挂 + 单源 margin 0.4% ≥ 0.2% → 判 True
-    bars = [(_jd(27), 7700.0), (_jd(31), 7710.0), (_d(14), 7740.0), (_d(1), 7690.0)]
+    bars = [(_jd(27), 7700.0), (_jd(31), 7710.0), (_d(13), 7740.0), (_d(1), 7690.0)]
     r = MarketResolver(
         _FakeQuotes({}), None, fetch_kline=_fake_kline(bars, errors={("yahoo", "^GSPC")})
     )
     out = r.resolve(_rh_question(), _rh_spec(), datetime(2026, 8, 15, 16, 30))
     assert out == (True, "tencent")
+
+
+# ---------- gt/lt_threshold：窗口内极值，而非窗口后单点快照 ----------
+
+
+def _th_spec(**kw) -> dict:
+    base = _rh_spec()
+    base.update(
+        {
+            "condition": "gt_threshold",
+            "value": 5000.0,
+            "instrument": "gold",
+            "source_primary": "sina",
+            "compare_symbol": "hf_GC",
+            "source_backup": None,
+            "backup_symbol": None,
+        }
+    )
+    base.update(kw)
+    return base
+
+
+def test_threshold_true_from_window_touch_not_end_spot():
+    # 8-10 触及 5100，8-13 回落到 4900 —— 旧实现看窗口后单点会判 False
+    bars = [(_d(1), 4800.0), (_d(10), 5100.0), (_d(13), 4900.0)]
+    r = MarketResolver(_FakeQuotes({}), None, fetch_kline=_fake_kline(bars))
+    out = r.resolve(_rh_question(), _th_spec(), datetime(2026, 8, 15, 16, 30))
+    assert out == (True, "yahoo")  # sina 无日线 → 回退 yahoo GC=F
+
+
+def test_threshold_lt_true_from_window_dip():
+    bars = [(_d(2), 7.05), (_d(8), 6.85), (_d(13), 6.95)]
+    spec = _th_spec(
+        condition="lt_threshold",
+        value=6.90,
+        instrument="usdcnh",
+        compare_symbol="fx_susdcnh",
+        close_timezone="Asia/Shanghai",
+    )
+    r = MarketResolver(_FakeQuotes({}), None, fetch_kline=_fake_kline(bars))
+    out = r.resolve(_rh_question(), spec, datetime(2026, 8, 14, 16, 30))
+    assert out == (True, "yahoo")
+
+
+def test_threshold_window_incomplete_degrades():
+    # 最后完整交易日应为 8-13；K 线只到 8-12 → 宽限内重试
+    bars = [(_d(1), 4800.0), (_d(10), 5100.0), (_d(12), 4900.0)]
+    r = MarketResolver(_FakeQuotes({}), None, fetch_kline=_fake_kline(bars))
+    assert r.resolve(_rh_question(), _th_spec(), datetime(2026, 8, 15, 16, 30)) is None
+
+
+def test_threshold_backup_disagrees_degrades():
+    spec = _th_spec(
+        source_primary="yahoo",
+        compare_symbol="GC=F",
+        source_backup="yahoo",
+        backup_symbol="^GSPC",
+        instrument="gold",
+    )
+
+    def f(provider, symbol):
+        if symbol == "^GSPC":
+            # 备源：窗口内未破 5000
+            return [(_d(1), 4800.0), (_d(10), 4990.0), (_d(13), 4900.0)]
+        return [(_d(1), 4800.0), (_d(10), 5100.0), (_d(13), 4900.0)]
+
+    r = MarketResolver(_FakeQuotes({}), None, fetch_kline=f)
+    assert r.resolve(_rh_question(), spec, datetime(2026, 8, 15, 16, 30)) is None

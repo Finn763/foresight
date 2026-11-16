@@ -26,6 +26,8 @@ def _no_calibrator(monkeypatch):
 class FakeClient:
     """search 结果池默认 = 队列里出现过的全部 URL（模拟检索覆盖测试引用）。"""
 
+    model = "deepseek-flash"  # 与真实 LLMClient 一致；model_runs 键由它派生
+
     def __init__(self, responses, delay: float = 0.0, search_urls=None):
         self._responses = list(responses)
         self.calls = []

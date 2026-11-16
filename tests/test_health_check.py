@@ -17,12 +17,16 @@ def _env():
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["FORESIGHT_OFFLINE"] = "1"
     env["PATH"] = str(ROOT / ".venv" / "Scripts") + os.pathsep + env.get("PATH", "")
     return env
 
 
 def run_hc(db: Path, now: datetime, cwd: Path, extra=None) -> subprocess.CompletedProcess:
-    cmd = [str(PY), HC, "--db", str(db), "--now", now.isoformat(), "--no-notify"]
+    cmd = [
+        str(PY), HC, "--db", str(db), "--now", now.isoformat(),
+        "--no-notify", "--no-probe",
+    ]
     return subprocess.run(
         cmd + (extra or []), cwd=cwd, env=_env(), capture_output=True, timeout=120
     )

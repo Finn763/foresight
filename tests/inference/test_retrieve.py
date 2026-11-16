@@ -38,6 +38,22 @@ class MemStore:
         return len(self.docs)
 
 
+def test_naive_now_is_beijing_not_utc():
+    """预测时点 8-11 09:00 北京 = 8-11 01:00 UTC；05:00 UTC 的文档是未来，必须剔除。"""
+    now = datetime(2026, 8, 11, 9, 0)
+    future_utc = Document(
+        source="fake",
+        url="future-utc",
+        title="t",
+        content="c",
+        published_at=datetime(2026, 8, 11, 5, 0),
+        fetched_at=now,
+    )
+    source = FakeSource([future_utc])
+    docs = retrieve_and_store(1, "Q", ["term"], [source], MemStore(), now=now)
+    assert docs == []
+
+
 def test_retrieve_filters_future_and_timeless_documents():
     now = datetime(2026, 8, 11)
     future = Document(

@@ -7,13 +7,13 @@
 ## Fork 来源
 
 - 上游仓库：https://github.com/earendil-works/pi （MIT License，作者 Mario Zechner）
-- Fork 基线版本：**v0.84.4**（2026-09-04 从 v0.84.1 同步，基线 commit `b79e4cc83` Release v0.84.4；原基线 v0.84.1/`40a3d85`）
-- 上游全局安装对照：`npm i -g @earendil-works/pi-coding-agent` = 0.84.4
+- Fork 基线版本：**v1.4.0**（2026-11-16 从 v0.84.4 同步，基线 commit `4a080252f` Release v1.4.0；
+  历史基线：v0.84.4/`b79e4cc83`、v0.84.1/`40a3d85`）
+- 上游全局安装对照：`npm i -g @earendil-works/pi-coding-agent` = 1.4.0
 - 本 fork 目录：`shell/pi/`，包名 `@foresight/foresight-agent`
-- 版本号政策（2026-09-04）：**跟 Foresight 走，不跟 pi**——`packages/coding-agent/package.json`
-  的 `version` 与预测引擎对齐（如 `0.3.1`），`--version` 显示 Foresight 版本；
-  底层 pi 基线记在这里（上节），升级只换基线不动版本号。同步 rebase 时 version
-  行必冲突，一律保留我方版本。
+- 版本号政策（2026-11-16 修订）：**与引擎解耦**——fork 只在 shell 行为变化时发版，
+  当前 fork `0.3.1` / 引擎 `0.4.0`；`--version` 显示 fork 版本，引擎版本看
+  `pyproject.toml`/`foresight-engine --version`。底层 pi 基线记在这里，升级只换基线。
 
 ## 改名原理（为什么只改 package.json 就够了）
 
@@ -38,10 +38,13 @@ export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
 
 ## 已做的改动（相对上游）
 
-共 2 个文件：
+共 5 个文件（`git diff --stat v1.4.0..HEAD`）：
 
-1. `packages/coding-agent/package.json`：上述三处改名（name/bin/piConfig）。
-2. `packages/coding-agent/src/core/extensions/loader.ts`：`createJiti(import.meta.url, {...})` 选项加 `fsCache: false`（2026-08-15 补丁）。
+1. `packages/coding-agent/package.json`：改名 name/bin/piConfig + description 改成预测 agent 定位 + version 0.3.1。
+2. `packages/coding-agent/src/cli/args.ts`：`--help` 首行与 `--system-prompt` 说明改成预测 agent 文案。
+3. `packages/coding-agent/src/modes/interactive/components/first-time-setup.ts`：首启欢迎语改成 "event prediction agent"。
+4. `packages/coding-agent/src/core/extensions/loader.ts`：`createJiti(import.meta.url, {...})` 选项加 `fsCache: false`（2026-08-15 补丁）。
+   - 说明：此项与 1-3 的改名/文案补丁分开记录；`package-lock.json` 为第 5 个文件（版本/包名同步，`npm ci` 一致性）。
    - 原因：jiti 的磁盘缓存（`%LOCALAPPDATA%\Temp\jiti\`）不按源文件 mtime 失效——改 `.foresight/extensions/*.ts` 后 `/reload` 甚至重启仍跑旧编译产物（实测：改坏脚本路径后旧代码仍生效，对抗测试确认）。
    - 位置：`loadExtensionModule()` 内，紧邻已有的 `moduleCache: false`；同款代码在构建产物 `dist/core/extensions/loader.js`（勿直接改 dist，改 src 后重新 build）。
    - 验证方法：改扩展文件任一字符串（如工具 description 加标记）→ 重启或 `/reload` → 交互模式问模型复述该 description / 直接读加载器输出，新字符串应立即出现；`%LOCALAPPDATA%\Temp\jiti\` 不应再新增扩展缓存文件（旧缓存残留文件可整目录清空）。
@@ -49,7 +52,7 @@ export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".pi";
 
 构建产物为 `packages/coding-agent/dist/bundle/cli.js`（0.84.2+ 上游改打包路径；npm link 后全局命令 `foresight` 指向它）。
 注（2026-09-04）：裸 `foresight` 归交互 agent 所有；Python 预测引擎直调走
-`~/.local/bin/foresight.exe`（uv tool 安装）。两者是同一产品的前后端，
+`foresight-engine`（uv tool 安装，2026-09-05 由 `foresight` 改名）。两者是同一产品的前后端，
 不要把 npm 预测包 link 到 `foresight` 名下抢占。
 
 ## 已知残留（不改，无功能影响）

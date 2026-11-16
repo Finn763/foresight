@@ -16,13 +16,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
-from scripts.daily import _build_sources, _log_event, _predict_safely, _within_update_window
 from predictor.config import Settings
 from predictor.data.storage import Storage
 from predictor.ops.lock import acquire_lock
 from predictor.resolution.auto_resolve import auto_resolve
 from predictor.resolution.spec import validate_resolution_spec
 from predictor.selection.families import generate_families
+from scripts.daily import _build_sources, _log_event, _predict_safely, _within_update_window
+
 
 def _data_dir(st) -> Path:
     p = getattr(st, "path", None)

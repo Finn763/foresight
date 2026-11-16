@@ -22,12 +22,13 @@ from predictor.config import Settings
 from predictor.data.gdelt_source import GDELTSource
 from predictor.data.newsapi_source import NewsAPISource
 from predictor.data.storage import Storage
-from predictor.resolution.spec import validate_resolution_spec
-from predictor.selection.families import generate_families
 from predictor.llm.client import LLMClient, dump_daily_usage
 from predictor.ops.lock import acquire_lock
 from predictor.ops.manual import manual_candidates
+from predictor.resolution.spec import validate_resolution_spec
+from predictor.selection.families import generate_families
 from predictor.websearch_predictor import predict_with_websearch
+
 
 def _build_sources() -> list:
     """构造数据源列表。FORESIGHT_DISABLE_SOURCES=gdelt,newsapi 可禁用。"""
@@ -104,7 +105,6 @@ def _run(args, settings: Settings) -> None:
     st.create_schema()
     _log_event(st, "round_started", json.dumps({"round": "daily_predict"}))
     client = LLMClient(**settings.llm_client_kwargs)
-    sources = _build_sources()
     now = datetime.now()
 
     predicted, skipped = 0, 0

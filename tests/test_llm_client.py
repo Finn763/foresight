@@ -209,3 +209,38 @@ def test_responses_create_reuses_async_client_across_retries():
     assert out["output"][0]["content"] == "ok"
     assert transport.requests == 3
     assert transport.closes == 1  # 全程一个 client（旧实现 = 3）
+
+
+def test_usage_counts_truncated_retry_attempts(monkeypatch):
+    """截断/空响应重试同样消耗 token：每个 200 都要记账，不能只记成功那次。"""
+    from datetime import date
+
+    from predictor.llm import client as client_mod
+
+    with client_mod._DAILY_USAGE_LOCK:
+        client_mod._DAILY_USAGE.pop(date.today().isoformat(), None)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": ""}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+            },
+        )
+
+    assert _client(handler).chat(None, [{"role": "user", "content": "hi"}]) == "ok"
+    rec = client_mod._DAILY_USAGE[date.today().isoformat()]
+    assert rec["prompt"] == 200
+    assert rec["completion"] == 60
+    assert rec["calls"] == 2

@@ -48,6 +48,25 @@ def assess(facts: dict, now: datetime) -> dict:
     resolve = _track_check("resolve", "evolve_resolve", "揭晓轮（16:30，唯一轨道）", rounds["evolve_resolve"]["started"], rounds["evolve_resolve"]["completed"], now)
     if resolve["status"] == "warn":
         resolve = _c("resolve", "error", "揭晓轮：今日未运行（唯一轨道，到期题将无法揭晓）")
+    elif resolve["status"] == "pending":
+        # 今日 18:30 宽限未到：检查上一个已过宽限的窗口（昨日）是否完成。
+        # 否则揭晓轮停摆后，次日 09:35 又只会看到「今日 pending」，永远不告警。
+        prev_due = (now.date() - timedelta(days=1)).isoformat()
+        last_done = facts.get("resolve_last_completed_date")
+        # >=：容忍跨午夜完成与测试注入的时钟漂移；缺失/早于昨日才算停摆。
+        if last_done is None or last_done < prev_due:
+            if facts.get("resolve_last_started_date") == prev_due:
+                resolve = _c(
+                    "resolve",
+                    "error",
+                    "揭晓轮：昨日已开始但未完成（崩溃签名：无 round_completed）",
+                )
+            else:
+                resolve = _c(
+                    "resolve",
+                    "error",
+                    "揭晓轮：昨日未运行（唯一轨道，到期题无法揭晓）",
+                )
     checks.append(resolve)
 
     b = facts["backlog"]

@@ -2,7 +2,8 @@
 // Foresight（pi fork @foresight/foresight-agent，configDir=.foresight）工具扩展。
 //
 // 只读工具（随时可用）：questions / question / leaderboard / scoreboard / system /
-//   calibration / health / events / logs / probe_quotes / backtest_report
+//   calibration / health / events / logs / probe_quotes / backtest_report /
+//   web_search / read_url（DeepSeek Search / Fetch API，取证与引用）
 // 写工具（白名单 + 人机确认，YOLO 开启后免确认）：
 //   predict（用户显式请求，免确认） / resolve / publish / run_round /
 //   schedule_questions / pm_fetch / pm_resolve / crawl_social / backtest /
@@ -316,7 +317,7 @@ interface BridgeContract {
     confirmGate: string;
     sequential: string;
   };
-  /** 通道清单（23 条 = 11 只读 + 12 写；第三条通道的 9 个 inline_json 已全部契约化） */
+  /** 通道清单（25 条 = 13 只读 + 12 写；第三条通道的 11 个 inline_json 已全部契约化） */
   channels: readonly BridgeChannelContract[];
 }
 
@@ -426,6 +427,26 @@ const BRIDGE_CONTRACT: BridgeContract = {
       ],
       timeoutMs: 60_000,
       pyApi: ["predictor.config.Settings", "pathlib.Path"],
+    },
+    {
+      name: "web_search",
+      kind: "read",
+      backend: "inline_json",
+      params: [
+        { name: "query", required: true },
+        { name: "count", required: false },
+        { name: "need_content", required: false },
+      ],
+      timeoutMs: 60_000,
+      pyApi: ["predictor.config.Settings", "predictor.llm.client.LLMClient"],
+    },
+    {
+      name: "read_url",
+      kind: "read",
+      backend: "inline_json",
+      params: [{ name: "url", required: true }],
+      timeoutMs: 90_000,
+      pyApi: ["predictor.config.Settings", "predictor.llm.client.LLMClient"],
     },
     {
       name: "probe_quotes",
@@ -802,6 +823,37 @@ const READ_BODY_LOGS = readBody("logs", [
   "        _out = {'name': name, 'count': 0, 'lines': [], 'error': 'log file not found'}",
 ]);
 
+const READ_BODY_WEB_SEARCH = readBody("web_search", [
+  "from predictor.config import Settings",
+  "from predictor.llm.client import LLMClient",
+  "p = json.loads(sys.argv[1])",
+  "client = LLMClient(**Settings().llm_client_kwargs)",
+  "rows = client.search(",
+  "    str(p['query']),",
+  "    count=max(1, min(int(p.get('count') or 5), 10)),",
+  "    need_content=bool(p.get('need_content')),",
+  ")",
+  "items = []",
+  "for r in rows:",
+  "    if not isinstance(r, dict) or not r.get('url'):",
+  "        continue",
+  "    item = {k: r.get(k) for k in ('title', 'url', 'site_name', 'date', 'authority', 'rerank_score')}",
+  "    item['summary'] = str(r.get('summary') or r.get('snippet') or '')[:900]",
+  "    if p.get('need_content'):",
+  "        item['content'] = str(r.get('content') or '')[:4000]",
+  "    items.append(item)",
+  "_out = {'query': p['query'], 'count': len(items), 'results': items}",
+]);
+
+const READ_BODY_READ_URL = readBody("read_url", [
+  "from predictor.config import Settings",
+  "from predictor.llm.client import LLMClient",
+  "p = json.loads(sys.argv[1])",
+  "client = LLMClient(**Settings().llm_client_kwargs)",
+  "page = client.fetch(str(p['url']))",
+  "_out = {'url': p['url'], 'title': page.get('title', ''), 'content': (page.get('content') or '')[:40000]}",
+]);
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("yolo", {
     description: "启动即进入 YOLO 模式：写操作免确认，并解除预测 agent 的 coding 边界",
@@ -1109,6 +1161,95 @@ export default function (pi: ExtensionAPI) {
             {
               type: "text",
               text: await runReadJson(pi, ctx.cwd, READ_BODY_LOGS, payload, channelTimeout("logs"), signal),
+            },
+          ],
+          details: {},
+        };
+      },
+    }),
+  );
+
+  contractTool(
+    pi,
+    defineTool({
+      name: "web_search",
+      label: "Web Search",
+      description:
+        "联网搜索（只读，DeepSeek Search API，¥5/千次成功请求）：返回标题/URL/站点/发布时间/权威度/摘要，" +
+        "用于取证与引用；query 支持 site: / after: / before: / \"精确短语\" / -排除 等搜索语法。",
+      parameters: Type.Object({
+        query: Type.String({
+          minLength: 1,
+          maxLength: 128,
+          description: "搜索词（1-128 字符），可用 site: / after: / before: / -排除 等语法",
+        }),
+        count: Type.Optional(
+          Type.Integer({ minimum: 1, maximum: 10, default: 5, description: "返回条数（1-10）" }),
+        ),
+        need_content: Type.Optional(
+          Type.Boolean({ default: false, description: "是否带回网页正文（更长，单次价格不变）" }),
+        ),
+      }),
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const payload = {
+          query: params.query,
+          count: params.count ?? 5,
+          need_content: params.need_content ?? false,
+        };
+        return {
+          content: [
+            {
+              type: "text",
+              text: clipText(
+                await runReadJson(
+                  pi,
+                  ctx.cwd,
+                  READ_BODY_WEB_SEARCH,
+                  payload,
+                  channelTimeout("web_search"),
+                  signal,
+                ),
+                60_000,
+              ),
+            },
+          ],
+          details: {},
+        };
+      },
+    }),
+  );
+
+  contractTool(
+    pi,
+    defineTool({
+      name: "read_url",
+      label: "Read URL",
+      description:
+        "抓取单个网页并转成 Markdown 正文（只读，DeepSeek Fetch API，¥5/千次成功请求）：" +
+        "用于阅读 web_search 结果或用户给出的链接；抓不到正文时返回 error（403/404 不重试）。",
+      parameters: Type.Object({
+        url: Type.String({
+          minLength: 1,
+          maxLength: 8192,
+          description: "含 host 的 http(s) 链接（不能带用户名密码）",
+        }),
+      }),
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: clipText(
+                await runReadJson(
+                  pi,
+                  ctx.cwd,
+                  READ_BODY_READ_URL,
+                  { url: params.url },
+                  channelTimeout("read_url"),
+                  signal,
+                ),
+                60_000,
+              ),
             },
           ],
           details: {},

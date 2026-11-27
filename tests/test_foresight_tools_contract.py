@@ -3,7 +3,7 @@
 覆盖两层契约（CC 评审 §1.2「第三条调用通道无契约」+ §4.2 predict 超时）：
   1. predict 工具超时必须 ≥ 引擎最坏时长（原有 3 例，§4.2）；
   2. BRIDGE_CONTRACT 单一契约常量不被破坏：版本、通道清单、参数白名单、
-     超时值、第三条通道（9 个内联只读体）pyApi 白名单、Python 拉起单漏斗、
+     超时值、第三条通道（11 个内联只读体）pyApi 白名单、Python 拉起单漏斗、
      错误语义、YOLO 关闭时 bash/edit/write 拦截护栏。
 
 引擎最坏时长计算依据（与 TS 注释同源，改任何一侧先读这里）：
@@ -35,7 +35,7 @@ CLIENT_PY = _PROJECT_ROOT / "src" / "predictor" / "llm" / "client.py"
 ENGINE_WORST_MS = (363 + 20) * 1000
 MIN_TIMEOUT_MS = 15 * 60 * 1000  # 任务要求：≥ 15 分钟
 
-# 22 条通道清单（与 BRIDGE_CONTRACT.channels 一一对应；改任何一侧先改这里）
+# 25 条通道清单（与 BRIDGE_CONTRACT.channels 一一对应；改任何一侧先改这里）
 # key=工具名；值=(kind, backend, 参数白名单[(name, required)...], 静态超时ms 或 None, entry 或 None)
 EXPECTED_CHANNELS = {
     "questions": ("read", "inline_json", [("status", False), ("q", False), ("limit", False)], 60_000, None),
@@ -47,6 +47,14 @@ EXPECTED_CHANNELS = {
     "health": ("read", "inline_json", [("refresh", False)], 150_000, None),
     "events": ("read", "inline_json", [("types", False), ("limit", False), ("before_id", False)], 60_000, None),
     "logs": ("read", "inline_json", [("name", True), ("lines", False)], 60_000, None),
+    "web_search": (
+        "read",
+        "inline_json",
+        [("query", True), ("count", False), ("need_content", False)],
+        60_000,
+        None,
+    ),
+    "read_url": ("read", "inline_json", [("url", True)], 90_000, None),
     "probe_quotes": ("read", "script", [], 90_000, "scripts/probe_quotes.py"),
     "backtest_report": ("read", "fs_json", [], None, None),
     "predict": ("write", "script", [("question", False), ("closes", False), ("qid", False)], 900_000, "scripts/predict_cli.py"),
@@ -76,7 +84,7 @@ EXPECTED_CHANNELS = {
     "fb_dry_run": ("write", "script", [("limit", False)], 1_800_000, None),
 }
 
-# 第三条通道：9 个 inline_json 只读工具（内联 Python 直调引擎内部 API，受 pyApi 白名单约束）
+# 第三条通道：11 个 inline_json 只读工具（内联 Python 直调引擎内部 API，受 pyApi 白名单约束）
 INLINE_READ_TOOLS = [
     "questions",
     "question",
@@ -87,6 +95,8 @@ INLINE_READ_TOOLS = [
     "health",
     "events",
     "logs",
+    "web_search",
+    "read_url",
 ]
 
 
@@ -185,7 +195,7 @@ def test_contract_constant_exists_and_version():
 
 
 def test_contract_channel_inventory_matches_registered_tools():
-    """通道清单：契约登记的 22 条 ⇔ 实际经 contractTool 注册的 22 条，双向一致。"""
+    """通道清单：契约登记的 25 条 ⇔ 实际经 contractTool 注册的 25 条，双向一致。"""
     blocks = _channel_blocks()
     assert set(blocks) == set(EXPECTED_CHANNELS), (
         f"契约通道清单与预期不一致：契约多={set(blocks) - set(EXPECTED_CHANNELS)}，"
@@ -250,7 +260,7 @@ def test_contract_timeouts():
 
 
 def test_contract_inline_bodies_hoisted_through_readbody_gate():
-    """第三条通道收紧：9 个 inline_json 只读体的构建必须经 readBody 门（模块级，加载期校验）。"""
+    """第三条通道收紧：11 个 inline_json 只读体的构建必须经 readBody 门（模块级，加载期校验）。"""
     src = _tools_src()
     hoisted = dict(re.findall(r"const READ_BODY_(\w+) = readBody\(\"(\w+)\"", src))
     for tool in INLINE_READ_TOOLS:

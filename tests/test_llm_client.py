@@ -244,3 +244,69 @@ def test_usage_counts_truncated_retry_attempts(monkeypatch):
     assert rec["prompt"] == 200
     assert rec["completion"] == 60
     assert rec["calls"] == 2
+
+
+# ============================================================================
+# Fetch API（/v1/tools/fetch）：请求形状、返回、重试语义
+# ============================================================================
+
+
+def test_fetch_posts_url_and_returns_page():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(200, json={"title": "T", "content": "# body"})
+
+    page = _client(handler).fetch("https://example.com/a")
+    assert seen["url"] == "https://api.deepseek.com/v1/tools/fetch"
+    assert seen["json"] == {"url": "https://example.com/a"}
+    assert page == {"title": "T", "content": "# body"}
+
+
+def test_fetch_missing_fields_default_to_empty_strings():
+    page = _client(lambda r: httpx.Response(200, json={})).fetch("https://example.com/a")
+    assert page == {"title": "", "content": ""}
+
+
+def test_fetch_does_not_retry_deterministic_4xx():
+    """403/404 是确定性失败：立即抛 LLMError，不重复计费。"""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(
+            404, json={"error": {"message": "failed to fetch URL", "type": "not_found_error"}}
+        )
+
+    with pytest.raises(LLMError) as ei:
+        _client(handler).fetch("https://example.com/missing")
+    assert calls["n"] == 1
+    assert "404" in str(ei.value) and "failed to fetch URL" in str(ei.value)
+
+
+def test_fetch_retries_retryable_status_then_succeeds():
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, json={"error": {"message": "rate limited"}})
+        return httpx.Response(200, json={"title": "T", "content": "body"})
+
+    page = _client(handler, max_retries=1).fetch("https://example.com/a")
+    assert calls["n"] == 2
+    assert page["content"] == "body"
+
+
+def test_fetch_rejects_non_http_url_without_request():
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"title": "", "content": ""})
+
+    with pytest.raises(LLMError):
+        _client(handler).fetch("file:///etc/passwd")
+    assert calls["n"] == 0

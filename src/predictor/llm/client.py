@@ -5,6 +5,7 @@ import json
 import threading
 from datetime import date
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -71,6 +72,22 @@ def _has_answer(items) -> bool:
         ):
             return True
     return False
+
+
+# Fetch API 只在这些状态码上重试（官方错误表：408/429/5xx 可重试）；
+# 403/404 等确定性失败立即报错，不为同一个抓不到的 URL 重复计费。
+_FETCH_RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _error_detail(resp: httpx.Response) -> str:
+    """取 OpenAI 兼容错误体里的 message；取不到就回退截断原文。"""
+    try:
+        data = resp.json()
+    except ValueError:
+        return resp.text[:200]
+    err = data.get("error") if isinstance(data, dict) else None
+    message = err.get("message") if isinstance(err, dict) else None
+    return str(message)[:200] if message else resp.text[:200]
 
 
 async def _post_with_retry(client, url, payload, headers, max_retries, check):
@@ -217,6 +234,50 @@ class LLMClient:
     def search(self, query: str, **kw) -> list[dict]:
         """同步封装（揭晓器等同步调用点用）。"""
         return asyncio.run(self.asearch(query, **kw))
+
+    async def afetch(self, url: str) -> dict:
+        """DeepSeek Fetch API（POST /v1/tools/fetch）：单页 → Markdown 正文。
+
+        与 asearch 同一 Bearer 鉴权；按成功请求计费（5元/千次），失败/无正文不计费。
+        错误表（2026-11 官方文档）：403=抓取被安全策略拒绝，404=拿不到可提取正文，
+        408/429/5xx 可等待后重试——其余 4xx 不重试，避免重复计费与空转。
+        """
+        target = url.strip()
+        parts = urlsplit(target)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise LLMError(f"Fetch 需要含 host 的 http(s) URL：{target[:200]}")
+        payload: dict[str, Any] = {"url": target}
+        url_ = f"{self.base_url}/v1/tools/fetch"
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        last_err: Exception | None = None
+        async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
+            for attempt in range(self.max_retries + 1):
+                try:
+                    resp = await client.post(url_, json=payload, headers=headers)
+                except httpx.HTTPError as e:
+                    last_err = e
+                else:
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except ValueError as e:
+                            raise LLMError(f"Fetch 返回非法 JSON: {resp.text[:200]}") from e
+                        if not isinstance(data, dict):
+                            raise LLMError(f"Fetch 返回非 JSON 对象: {str(data)[:200]}")
+                        return {
+                            "title": str(data.get("title") or ""),
+                            "content": str(data.get("content") or ""),
+                        }
+                    last_err = LLMError(f"Fetch HTTP {resp.status_code}: {_error_detail(resp)}")
+                    if resp.status_code not in _FETCH_RETRY_STATUS:
+                        raise last_err
+                if attempt < self.max_retries:
+                    await asyncio.sleep(2**attempt)
+        raise LLMError(f"Fetch failed after retries: {last_err}")
+
+    def fetch(self, url: str) -> dict:
+        """同步封装（扩展内联体等同步调用点用）。"""
+        return asyncio.run(self.afetch(url))
 
     def responses_create(
         self,
